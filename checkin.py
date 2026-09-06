@@ -236,24 +236,32 @@ def main():
 
             page.screenshot(path="step1b_filled.png")
 
-            # 4. 点击登录按钮：找第一个可见button，或包含登录文字的元素
+                        # 4. 点击登录按钮：排除第三方登录，优先纯"登录"文字
             time.sleep(0.5)
             login_btn = None
             all_buttons = page.locator("button")
             btn_count = all_buttons.count()
             print(f"页面共有 {btn_count} 个button")
+            candidates = []
             for i in range(btn_count):
                 try:
                     btn = all_buttons.nth(i)
                     if btn.is_visible():
-                        txt = btn.inner_text(timeout=500)
+                        txt = btn.inner_text(timeout=500).strip()
+                        txt_nospace = txt.replace(" ", "").replace("\u3000", "")
                         print(f"  button[{i}]: text='{txt}'")
-                        if "登录" in txt or "登陆" in txt or "Sign" in txt:
-                            login_btn = btn
-                            print(f"选中登录按钮: button[{i}]")
-                            break
+                        # 排除第三方登录按钮
+                        is_third_party = any(k in txt for k in ["Apple", "QQ", "微信", "WeChat", "Github", "Google", "第三方"])
+                        if not is_third_party and ("登录" in txt_nospace or "登陆" in txt_nospace or "Sign" in txt):
+                            candidates.append((i, btn, len(txt)))
                 except:
                     continue
+            # 选文字最短的（纯"登录"按钮比"登录并同意..."短）
+            if candidates:
+                candidates.sort(key=lambda x: x[2])
+                login_btn = candidates[0][1]
+                print(f"选中登录按钮: button[{candidates[0][0]}]")
+
 
             if not login_btn:
                 # 兜底：第一个可见button
