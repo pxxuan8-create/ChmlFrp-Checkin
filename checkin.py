@@ -694,7 +694,7 @@ def main():
                     result_msg = "MFA 二次验证失败"
                     page.screenshot(path="error_mfa.png")
                     print(result_msg)
-                    send_email(f"【ChmlFrp自动签到】{bj_now()} 失败", build_mail_body(False, bj_now(), sign_before, 0, sign_after, result_msg))
+                    send_email(f"【ChmlFrp签到失败】{bj_now()}", build_mail_body(False, bj_now(), sign_before, 0, sign_after, result_msg))
                     browser.close()
                     sys.exit(1)
                 time.sleep(3)
@@ -712,7 +712,7 @@ def main():
                 result_msg = "登录失败，仍在认证页面"
                 page.screenshot(path="error_login_fail.png")
                 print(result_msg)
-                send_email(f"【ChmlFrp自动签到】{bj_now()} 失败", build_mail_body(False, bj_now(), sign_before, 0, sign_after, result_msg))
+                send_email(f"【ChmlFrp签到失败】{bj_now()}", build_mail_body(False, bj_now(), sign_before, 0, sign_after, result_msg))
                 browser.close()
                 sys.exit(1)
 
@@ -774,7 +774,7 @@ def main():
                 result_msg = "未找到签到按钮"
                 page.screenshot(path="error_no_sign.png")
                 print(result_msg)
-                send_email(f"【ChmlFrp自动签到】{bj_now()} 失败", build_mail_body(False, bj_now(), sign_before, 0, sign_after, result_msg))
+                send_email(f"【ChmlFrp签到失败】{bj_now()}", build_mail_body(False, bj_now(), sign_before, 0, sign_after, result_msg))
                 browser.close()
                 sys.exit(1)
 
@@ -787,7 +787,7 @@ def main():
                         result_msg = "极验验证失败"
                         page.screenshot(path="geetest_fail.png")
                         print(result_msg)
-                        send_email(f"【ChmlFrp自动签到】{bj_now()} 失败", build_mail_body(False, bj_now(), sign_before, 0, sign_after, result_msg))
+                        send_email(f"【ChmlFrp签到失败】{bj_now()}", build_mail_body(False, bj_now(), sign_before, 0, sign_after, result_msg))
                         browser.close()
                         sys.exit(1)
             except:
@@ -816,7 +816,7 @@ def main():
 
             # 12. 组装并发送邮件
             body = build_mail_body(success, bj_now(), sign_before, reward, sign_after, result_msg + ("，"+note if note else ""))
-            subject = f"【ChmlFrp自动签到】{bj_now()} {'成功' if success else '失败'}"
+            subject = f"【ChmlFrp签到{'成功' if success else '失败'}】{bj_now()}"
             print("===== 邮件内容 =====")
             print(subject)
             print(body)
@@ -833,7 +833,7 @@ def main():
             except:
                 pass
             body = build_mail_body(False, bj_now(), sign_before, 0, sign_after, result_msg)
-            send_email(f"【ChmlFrp自动签到】{bj_now()} 失败", body)
+            send_email(f"【ChmlFrp签到失败】{bj_now()}", body)
 
         browser.close()
 
