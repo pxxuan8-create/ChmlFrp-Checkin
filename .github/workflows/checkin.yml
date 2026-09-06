@@ -26,6 +26,7 @@ jobs:
           CHML_USERNAME: ${{ secrets.CHML_USERNAME }}
           CHML_PASSWORD: ${{ secrets.CHML_PASSWORD }}
           CHML_URL: ${{ secrets.CHML_URL }}
+          TOTP_SECRET: ${{ secrets.TOTP_SECRET }}
           AI_BASE_URL: ${{ secrets.AI_BASE_URL }}
           AI_API_KEY: ${{ secrets.AI_API_KEY }}
           AI_MODEL: ${{ secrets.AI_MODEL }}
