@@ -16,6 +16,7 @@ SMTP_USER = os.environ.get("SMTP_USER", "")
 SMTP_PASS = os.environ.get("SMTP_PASS", "")
 SMTP_TO = os.environ.get("SMTP_TO", "")
 
+
 def ai_analyze_image(image_b64, prompt):
     headers = {"Authorization": f"Bearer {AI_API_KEY}", "Content-Type": "application/json"}
     payload = {
@@ -36,6 +37,7 @@ def ai_analyze_image(image_b64, prompt):
         print(f"AI调用失败: {e}")
     return None
 
+
 def send_email(subject, body):
     if not all([SMTP_HOST, SMTP_USER, SMTP_PASS, SMTP_TO]):
         print("邮件未配置，跳过通知")
@@ -53,13 +55,13 @@ def send_email(subject, body):
     except Exception as e:
         print(f"邮件发送失败: {e}")
 
+
 def fetch_email_code():
     """从QQ邮箱读取最新的QZhua/ChmlFrp验证邮件，提取6位验证码"""
     if not EMAIL_ADDRESS or not EMAIL_IMAP_PASSWORD:
         print("邮箱未配置")
         return None
 
-    # QQ邮箱IMAP配置
     imap_server = "imap.qq.com"
     imap_port = 993
 
@@ -68,22 +70,19 @@ def fetch_email_code():
         mail.login(EMAIL_ADDRESS, EMAIL_IMAP_PASSWORD)
         mail.select("INBOX")
 
-        # 搜索最近的验证邮件（主题包含 验证/验证码，或发件人包含 qzhua/chmlfrp）
-        # 先搜主题
-        result, data = mail.search(None, '(OR SUBJECT "验证" SUBJECT "验证码")')
+        # 不用IMAP搜索（中文搜索会ASCII编码报错），直接取最近30封，在Python里过滤
+        result, data = mail.search(None, "ALL")
         if result != "OK" or not data[0]:
-            # 再搜发件人
-            result, data = mail.search(None, '(OR FROM "qzhua" FROM "chmlfrp")')
-
-        if result != "OK" or not data[0]:
-            print("未找到验证邮件")
+            print("收件箱为空")
             mail.logout()
             return None
 
-        # 取最新的5封，找时间最近的
         ids = data[0].split()
-        latest_ids = ids[-5:] if len(ids) >= 5 else ids
+        latest_ids = ids[-30:] if len(ids) >= 30 else ids
         latest_ids.reverse()  # 最新的在前
+
+        import datetime
+        from email.utils import parsedate_to_datetime
 
         for eid in latest_ids:
             result, msg_data = mail.fetch(eid, "(RFC822)")
@@ -91,23 +90,32 @@ def fetch_email_code():
                 continue
             msg = email.message_from_bytes(msg_data[0][1])
 
-            # 解析主题
+            # 解析主题（兼容多种编码）
             subject = ""
             subj_parts = decode_header(msg["Subject"])
             for part, enc in subj_parts:
                 if isinstance(part, bytes):
-                    subject += part.decode(enc or "utf-8", errors="ignore")
+                    try:
+                        subject += part.decode(enc or "utf-8", errors="ignore")
+                    except:
+                        subject += part.decode("utf-8", errors="ignore")
                 else:
                     subject += part
 
             # 解析发件人
             from_addr = msg.get("From", "")
+            from_lower = from_addr.lower()
+
+            # Python里过滤：主题含验证/验证码/code，或发件人含qzhua/chmlfrp
+            is_verify_email = any(k in subject for k in ["验证", "验证码", "code", "Code", "CODE", "动态码"]) or \
+                              any(k in from_lower for k in ["qzhua", "chmlfrp"])
+
+            if not is_verify_email:
+                continue
 
             # 只看最近10分钟的邮件
-            from email.utils import parsedate_to_datetime
             try:
                 msg_date = parsedate_to_datetime(msg["Date"])
-                import datetime
                 if (datetime.datetime.now(datetime.timezone.utc) - msg_date).total_seconds() > 600:
                     continue
             except:
@@ -135,16 +143,16 @@ def fetch_email_code():
                 except:
                     pass
 
-            # 去掉HTML标签
+            # 去HTML标签，压缩空白
             body_clean = re.sub(r"<[^>]+>", " ", body)
             body_clean = re.sub(r"\s+", " ", body_clean)
 
-            # 找6位数字验证码
-            # 常见格式："验证码：123456"、"验证码 123456"、"123456"
+            # 找6位数字验证码（优先匹配"验证码：xxx"格式，兜底纯6位数字）
             patterns = [
-                r"验证码[：:\s]*(\d{6})",
-                r"验证代码[：:\s]*(\d{6})",
-                r"code[：:\s]*(\d{6})",
+                r"验证码[：:\s是为]+(\d{6})",
+                r"验证代码[：:\s是为]+(\d{6})",
+                r"动态码[：:\s是为]+(\d{6})",
+                r"code[：:\s是为]+(\d{6})",
                 r"(\d{6})",
             ]
             for pat in patterns:
@@ -155,13 +163,16 @@ def fetch_email_code():
                     mail.logout()
                     return code
 
-        print("邮件中未找到6位验证码")
+        print("最近30封邮件中未找到有效验证码")
         mail.logout()
         return None
 
     except Exception as e:
         print(f"读取邮箱失败: {e}")
+        import traceback
+        traceback.print_exc()
         return None
+
 
 def solve_geetest(page):
     for attempt in range(3):
@@ -239,6 +250,7 @@ def solve_geetest(page):
             return True
     print("极验验证3次均失败")
     return False
+
 
 def handle_mfa(page):
     """处理 MFA 二次验证：邮箱验证码方式"""
@@ -337,7 +349,6 @@ def handle_mfa(page):
 
     # 填入验证码
     time.sleep(1)
-    # 重新获取输入框（切换模式后可能变了）
     all_inputs = page.locator("input")
     digit_inputs = []
     for i in range(all_inputs.count()):
@@ -408,6 +419,7 @@ def handle_mfa(page):
         return False
     print("MFA 验证通过！")
     return True
+
 
 def main():
     result_msg, success = "", False
@@ -680,6 +692,7 @@ def main():
     send_email(f"ChmlFrp每日签到 - {status}", result_msg)
     if not success:
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
