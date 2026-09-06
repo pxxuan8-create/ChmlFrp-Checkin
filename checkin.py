@@ -94,11 +94,13 @@ def send_email(subject, body):
         return False
 
 
-def fetch_email_code():
+def fetch_email_code(since_utc=None):
     """
     从 QQ 邮箱读取最新的 QZhua/ChmlFrp 验证邮件，提取 6 位验证码。
     - 不用 IMAP 中文搜索（会触发 ASCII 编码错误），直接取最近 30 封在 Python 里过滤。
     - 只认最近 10 分钟内的验证邮件。
+    - since_utc: 若指定，只接受邮件 Date >= since_utc - 60秒 的新邮件，
+      避免在频繁测试时读到上一轮遗留的旧验证码。
     """
     if not EMAIL_ADDRESS or not EMAIL_IMAP_PASSWORD:
         print("邮箱未配置")
@@ -153,6 +155,10 @@ def fetch_email_code():
 
             try:
                 msg_date = parsedate_to_datetime(msg["Date"])
+                if since_utc is not None and msg_date < since_utc - timedelta(seconds=60):
+                    # 太旧：本次 MFA 流程开始前的邮件（很可能是上一次运行遗留）
+                    print(f"  跳过旧验证码邮件: 主题='{subject}', Date={msg_date}")
+                    continue
                 if (_dt.datetime.now(_dt.timezone.utc) - msg_date).total_seconds() > 600:
                     continue
             except:
@@ -288,8 +294,9 @@ def solve_geetest(page):
 def handle_mfa(page):
     """
     处理 OAuth2 MFA 二次验证（邮箱验证码方式）。
-    优化：切换"邮箱验证码"模式后，若系统已自动发送验证码则直接读邮箱，
-    读不到才点"发送/重新发送"，避免每次重复发两封邮件。
+    - 记录流程开始时间，只接受"本次流程开始后"发出的验证码邮件，
+      避免频繁测试时读到上一轮遗留的旧验证码（旧码已失效会导致提交失败）。
+    - 最多重试 3 次：读新码 -> 填入 -> 提交；失败则点"重新发送"再试。
     """
     if "/mfa" not in page.url:
         print("未检测到 MFA 页面，跳过")
@@ -300,7 +307,10 @@ def handle_mfa(page):
         return False
 
     print("检测到 MFA 页面，使用邮箱验证码方式")
-    time.sleep(3)
+
+    # 记录 MFA 流程开始时间（在切选项卡自动发码之前）
+    mfa_start = datetime.now(timezone.utc)
+    time.sleep(2)
 
     # 切换到邮箱验证码模式
     email_mode = False
@@ -320,14 +330,8 @@ def handle_mfa(page):
         except:
             continue
 
-    # 先等几秒，看切换模式是否已自动发送验证码（避免重复发）
-    print("等待系统自动发送验证码...")
-    time.sleep(5)
-    code = fetch_email_code()
-    if code:
-        print("系统已自动发送验证码，无需再点发送")
-    else:
-        print("未检测到自动发送，点击发送按钮...")
+    def click_send_code():
+        """点击'发送验证码/重新发送'按钮"""
         send_clicked = False
         for text in ["发送验证码", "获取验证码", "发送", "重新发送", "获取"]:
             try:
@@ -344,90 +348,113 @@ def handle_mfa(page):
                         break
             except:
                 continue
-        if not send_clicked:
-            print("未找到发送按钮，可能已自动发送")
+        return send_clicked
 
-        for attempt in range(12):
-            print(f"等待验证码邮件... ({attempt+1}/12)")
-            code = fetch_email_code()
-            if code:
-                break
-            time.sleep(5)
+    def read_new_code():
+        """只读本次 MFA 流程开始后到达的新验证码"""
+        return fetch_email_code(since_utc=mfa_start)
 
-    if not code:
-        print("60秒内未收到验证码邮件")
-        return False
-
-    # 填入验证码
-    time.sleep(1)
-    all_inputs = page.locator("input")
-    digit_inputs = []
-    for i in range(all_inputs.count()):
-        try:
-            inp = all_inputs.nth(i)
-            itype = (inp.get_attribute("type") or "text").lower()
-            if itype in ["text", "tel", "number"] and inp.is_visible():
-                iname = (inp.get_attribute("name") or "").lower()
-                if "csrf" not in iname and "continue" not in iname and "finger" not in iname:
-                    digit_inputs.append(inp)
-        except:
-            pass
-
-    print(f"找到 {len(digit_inputs)} 个可见输入框")
-    filled = False
-
-    if len(digit_inputs) >= 6:
-        print("使用6框模式输入")
-        for i, ch in enumerate(code[:6]):
+    def fill_and_submit(code):
+        """填入验证码并提交，返回 True 表示提交动作已执行"""
+        time.sleep(1)
+        all_inputs = page.locator("input")
+        digit_inputs = []
+        for i in range(all_inputs.count()):
             try:
-                digit_inputs[i].click()
-                time.sleep(0.1)
-                digit_inputs[i].type(ch, delay=30)
-            except Exception as e:
-                print(f"输入第{i+1}位失败: {e}")
-        filled = True
-    elif len(digit_inputs) >= 1:
-        print("使用单框模式输入")
-        digit_inputs[0].click()
-        time.sleep(0.1)
-        digit_inputs[0].type(code, delay=50)
-        filled = True
+                inp = all_inputs.nth(i)
+                itype = (inp.get_attribute("type") or "text").lower()
+                if itype in ["text", "tel", "number"] and inp.is_visible():
+                    iname = (inp.get_attribute("name") or "").lower()
+                    if "csrf" not in iname and "continue" not in iname and "finger" not in iname:
+                        digit_inputs.append(inp)
+            except:
+                pass
 
-    if not filled:
-        print("无法填入验证码")
-        return False
+        print(f"找到 {len(digit_inputs)} 个可见输入框")
+        filled = False
 
-    time.sleep(1)
+        if len(digit_inputs) >= 6:
+            print("使用6框模式输入")
+            for i, ch in enumerate(code[:6]):
+                try:
+                    digit_inputs[i].click()
+                    time.sleep(0.1)
+                    digit_inputs[i].type(ch, delay=30)
+                except Exception as e:
+                    print(f"输入第{i+1}位失败: {e}")
+            filled = True
+        elif len(digit_inputs) >= 1:
+            print("使用单框模式输入")
+            digit_inputs[0].click()
+            time.sleep(0.1)
+            digit_inputs[0].type(code, delay=50)
+            filled = True
 
-    # 点击确认/提交按钮
-    submit_clicked = False
-    for text in ["确认", "验证", "提交", "登录", "继续", "下一步", "Verify", "Submit"]:
-        try:
-            btn = page.get_by_text(text, exact=False)
-            if btn.count() > 0:
-                for i in range(btn.count()):
-                    if btn.nth(i).is_visible():
-                        btn.nth(i).click()
-                        print(f"点击了'{text}'按钮")
-                        submit_clicked = True
+        if not filled:
+            print("无法填入验证码")
+            return False
+
+        time.sleep(1)
+        submit_clicked = False
+        for text in ["确认", "验证", "提交", "登录", "继续", "下一步", "Verify", "Submit"]:
+            try:
+                btn = page.get_by_text(text, exact=False)
+                if btn.count() > 0:
+                    for i in range(btn.count()):
+                        if btn.nth(i).is_visible():
+                            btn.nth(i).click()
+                            print(f"点击了'{text}'按钮")
+                            submit_clicked = True
+                            break
+                    if submit_clicked:
                         break
-                if submit_clicked:
+            except:
+                continue
+        if not submit_clicked:
+            print("未找到确认按钮，按回车")
+            page.keyboard.press("Enter")
+        return True
+
+    # 主重试循环
+    for attempt in range(1, 4):
+        print(f"===== MFA 验证码尝试 {attempt}/3 =====")
+
+        # 1. 先读新码（切换选项卡可能已自动发送；时间过滤只认新邮件）
+        time.sleep(3)
+        code = read_new_code()
+        if not code:
+            print("未读到新验证码，点击发送...")
+            click_send_code()
+            for i in range(12):
+                print(f"等待新验证码邮件... ({i+1}/12)")
+                code = read_new_code()
+                if code:
                     break
-        except:
+                time.sleep(5)
+
+        if not code:
+            print("60秒内未收到新验证码邮件")
             continue
 
-    if not submit_clicked:
-        print("未找到确认按钮，按回车")
-        page.keyboard.press("Enter")
+        # 2. 填入并提交
+        fill_and_submit(code)
+        time.sleep(5)
+        print(f"MFA提交后URL: {page.url}")
 
-    time.sleep(5)
-    print(f"MFA提交后URL: {page.url}")
+        if "/mfa" not in page.url:
+            print("MFA 验证通过！")
+            return True
 
-    if "/mfa" in page.url:
-        print("MFA 验证后仍在 MFA 页面，可能验证失败")
-        return False
-    print("MFA 验证通过！")
-    return True
+        print(f"尝试{attempt}失败，仍在 MFA 页面（可能验证码过期/填错），重试...")
+        # 失败：点"重新发送"拿新码，进入下一轮
+        try:
+            click_send_code()
+        except:
+            pass
+        time.sleep(2)
+
+    print("MFA 3次尝试均失败")
+    return False
 
 
 def remove_modal_overlays(page):
