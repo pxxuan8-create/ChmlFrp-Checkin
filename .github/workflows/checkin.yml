@@ -1,10 +1,8 @@
 name: ChmlFrp自动签到
-
 on:
   schedule:
     - cron: '0 1 * * *'   # 北京时间每天9:00（UTC 1:00）
   workflow_dispatch:        # 支持手动触发
-
 jobs:
   checkin:
     runs-on: ubuntu-latest
@@ -22,7 +20,7 @@ jobs:
           playwright install chromium
       
       - name: 执行签到
-                env:
+        env:
           CHML_USERNAME: ${{ secrets.CHML_USERNAME }}
           CHML_PASSWORD: ${{ secrets.CHML_PASSWORD }}
           CHML_URL: ${{ secrets.CHML_URL }}
