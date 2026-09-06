@@ -1,11 +1,13 @@
-import os, json, time, base64, requests, sys
-import pyotp
+import os, json, time, base64, requests, sys, re
+import imaplib, email
+from email.header import decode_header
 from playwright.sync_api import sync_playwright
 
 USERNAME = os.environ.get("CHML_USERNAME", "")
 PASSWORD = os.environ.get("CHML_PASSWORD", "")
 PANEL_URL = os.environ.get("CHML_URL", "https://panel.chmlfrp.net/home")
-TOTP_SECRET = os.environ.get("TOTP_SECRET", "")
+EMAIL_ADDRESS = os.environ.get("EMAIL_ADDRESS", "")
+EMAIL_IMAP_PASSWORD = os.environ.get("EMAIL_IMAP_PASSWORD", "")
 AI_BASE_URL = os.environ.get("AI_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
 AI_API_KEY = os.environ.get("AI_API_KEY", "")
 AI_MODEL = os.environ.get("AI_MODEL", "qwen-vl-plus")
@@ -50,6 +52,116 @@ def send_email(subject, body):
         print("邮件通知已发送")
     except Exception as e:
         print(f"邮件发送失败: {e}")
+
+def fetch_email_code():
+    """从QQ邮箱读取最新的QZhua/ChmlFrp验证邮件，提取6位验证码"""
+    if not EMAIL_ADDRESS or not EMAIL_IMAP_PASSWORD:
+        print("邮箱未配置")
+        return None
+
+    # QQ邮箱IMAP配置
+    imap_server = "imap.qq.com"
+    imap_port = 993
+
+    try:
+        mail = imaplib.IMAP4_SSL(imap_server, imap_port)
+        mail.login(EMAIL_ADDRESS, EMAIL_IMAP_PASSWORD)
+        mail.select("INBOX")
+
+        # 搜索最近的验证邮件（主题包含 验证/验证码，或发件人包含 qzhua/chmlfrp）
+        # 先搜主题
+        result, data = mail.search(None, '(OR SUBJECT "验证" SUBJECT "验证码")')
+        if result != "OK" or not data[0]:
+            # 再搜发件人
+            result, data = mail.search(None, '(OR FROM "qzhua" FROM "chmlfrp")')
+
+        if result != "OK" or not data[0]:
+            print("未找到验证邮件")
+            mail.logout()
+            return None
+
+        # 取最新的5封，找时间最近的
+        ids = data[0].split()
+        latest_ids = ids[-5:] if len(ids) >= 5 else ids
+        latest_ids.reverse()  # 最新的在前
+
+        for eid in latest_ids:
+            result, msg_data = mail.fetch(eid, "(RFC822)")
+            if result != "OK":
+                continue
+            msg = email.message_from_bytes(msg_data[0][1])
+
+            # 解析主题
+            subject = ""
+            subj_parts = decode_header(msg["Subject"])
+            for part, enc in subj_parts:
+                if isinstance(part, bytes):
+                    subject += part.decode(enc or "utf-8", errors="ignore")
+                else:
+                    subject += part
+
+            # 解析发件人
+            from_addr = msg.get("From", "")
+
+            # 只看最近10分钟的邮件
+            from email.utils import parsedate_to_datetime
+            try:
+                msg_date = parsedate_to_datetime(msg["Date"])
+                import datetime
+                if (datetime.datetime.now(datetime.timezone.utc) - msg_date).total_seconds() > 600:
+                    continue
+            except:
+                pass
+
+            print(f"找到候选邮件: 主题='{subject}', 发件人='{from_addr}'")
+
+            # 提取正文
+            body = ""
+            if msg.is_multipart():
+                for part in msg.walk():
+                    ctype = part.get_content_type()
+                    if ctype in ["text/plain", "text/html"]:
+                        try:
+                            payload = part.get_payload(decode=True)
+                            charset = part.get_content_charset() or "utf-8"
+                            body += payload.decode(charset, errors="ignore")
+                        except:
+                            pass
+            else:
+                try:
+                    payload = msg.get_payload(decode=True)
+                    charset = msg.get_content_charset() or "utf-8"
+                    body = payload.decode(charset, errors="ignore")
+                except:
+                    pass
+
+            # 去掉HTML标签
+            body_clean = re.sub(r"<[^>]+>", " ", body)
+            body_clean = re.sub(r"\s+", " ", body_clean)
+
+            # 找6位数字验证码
+            # 常见格式："验证码：123456"、"验证码 123456"、"123456"
+            patterns = [
+                r"验证码[：:\s]*(\d{6})",
+                r"验证代码[：:\s]*(\d{6})",
+                r"code[：:\s]*(\d{6})",
+                r"(\d{6})",
+            ]
+            for pat in patterns:
+                match = re.search(pat, body_clean, re.IGNORECASE)
+                if match:
+                    code = match.group(1)
+                    print(f"提取到验证码: {code}")
+                    mail.logout()
+                    return code
+
+        print("邮件中未找到6位验证码")
+        mail.logout()
+        return None
+
+    except Exception as e:
+        print(f"读取邮箱失败: {e}")
+        return None
 
 def solve_geetest(page):
     for attempt in range(3):
@@ -129,20 +241,20 @@ def solve_geetest(page):
     return False
 
 def handle_mfa(page):
-    """处理 MFA 二次验证：自动生成 TOTP 验证码并填入"""
+    """处理 MFA 二次验证：邮箱验证码方式"""
     if "/mfa" not in page.url:
         print("未检测到 MFA 页面，跳过")
         return True
 
-    if not TOTP_SECRET:
-        print("未配置 TOTP_SECRET，无法处理 MFA")
+    if not EMAIL_ADDRESS or not EMAIL_IMAP_PASSWORD:
+        print("未配置邮箱，无法处理 MFA")
         return False
 
-    print("检测到 MFA 页面，开始处理 TOTP 验证")
+    print("检测到 MFA 页面，使用邮箱验证码方式")
     time.sleep(3)
     page.screenshot(path="mfa_page.png")
 
-    # 打印页面元素，方便调试
+    # 打印页面元素
     all_inputs = page.locator("input")
     print(f"MFA页面共有 {all_inputs.count()} 个input")
     for i in range(all_inputs.count()):
@@ -163,58 +275,86 @@ def handle_mfa(page):
             btn = all_buttons.nth(i)
             if btn.is_visible():
                 txt = btn.inner_text(timeout=500)
-                print(f"  button[{i}]: text='{txt}'")
+                print(f"  button[{i}]: text='{txt[:80]}'")
         except:
             pass
 
-    # 如果有"验证器/TOTP/Authenticator"选项，先点击切换
-    for text in ["验证器", "TOTP", "Authenticator", "身份验证器", "动态验证码"]:
+    # 切换到邮箱验证码模式
+    email_mode = False
+    for text in ["邮箱验证码", "邮箱", "Email", "EMAIL"]:
         try:
             el = page.get_by_text(text, exact=False)
-            if el.count() > 0 and el.first.is_visible():
-                el.first.click()
-                print(f"点击了'{text}'选项")
-                time.sleep(2)
-                break
+            if el.count() > 0:
+                for i in range(el.count()):
+                    if el.nth(i).is_visible():
+                        el.nth(i).click()
+                        print(f"点击了'{text}'选项")
+                        email_mode = True
+                        time.sleep(2)
+                        break
+                if email_mode:
+                    break
         except:
             continue
 
-    # 生成 TOTP 验证码（重试3次，防止刚好跨30秒边界）
-    totp = pyotp.TOTP(TOTP_SECRET)
+    if not email_mode:
+        print("未找到邮箱验证码选项，尝试直接发送")
+
+    # 点击"发送验证码"按钮（如果有）
+    send_clicked = False
+    for text in ["发送验证码", "获取验证码", "发送", "重新发送", "获取"]:
+        try:
+            btn = page.get_by_text(text, exact=False)
+            if btn.count() > 0:
+                for i in range(btn.count()):
+                    if btn.nth(i).is_visible():
+                        btn.nth(i).click()
+                        print(f"点击了'{text}'按钮")
+                        send_clicked = True
+                        time.sleep(2)
+                        break
+                if send_clicked:
+                    break
+        except:
+            continue
+
+    if not send_clicked:
+        print("未找到发送按钮，可能已自动发送")
+
+    # 等待邮件并读取验证码（最多等60秒，每5秒查一次）
     code = None
-    for attempt in range(3):
-        code = totp.now()
-        print(f"生成 TOTP 验证码: {code} (尝试{attempt+1})")
-        # 验证一下还有效
-        if totp.verify(code, valid_window=1):
+    for attempt in range(12):
+        print(f"等待验证码邮件... ({attempt+1}/12)")
+        code = fetch_email_code()
+        if code:
             break
-        time.sleep(1)
+        time.sleep(5)
 
     if not code:
-        print("TOTP 验证码生成失败")
+        print("60秒内未收到验证码邮件")
+        page.screenshot(path="mfa_no_email.png")
         return False
 
-    # 填入验证码：尝试多种输入框结构
-    filled = False
-
-    # 方式1：6个单独的输入框（常见于 MFA 页面）
+    # 填入验证码
+    time.sleep(1)
+    # 重新获取输入框（切换模式后可能变了）
+    all_inputs = page.locator("input")
     digit_inputs = []
     for i in range(all_inputs.count()):
         try:
             inp = all_inputs.nth(i)
             itype = (inp.get_attribute("type") or "text").lower()
             if itype in ["text", "tel", "number"] and inp.is_visible():
-                # 排除隐藏的 csrf 等
                 iname = (inp.get_attribute("name") or "").lower()
                 if "csrf" not in iname and "continue" not in iname and "finger" not in iname:
                     digit_inputs.append(inp)
         except:
             pass
 
-    print(f"找到 {len(digit_inputs)} 个可见数字输入框")
+    print(f"找到 {len(digit_inputs)} 个可见输入框")
+    filled = False
 
     if len(digit_inputs) >= 6:
-        # 6个单独框，逐个输入
         print("使用6框模式输入")
         for i, ch in enumerate(code[:6]):
             try:
@@ -224,29 +364,15 @@ def handle_mfa(page):
             except Exception as e:
                 print(f"输入第{i+1}位失败: {e}")
         filled = True
-    elif len(digit_inputs) == 1:
-        # 一个输入框，输入完整6位
+    elif len(digit_inputs) >= 1:
         print("使用单框模式输入")
         digit_inputs[0].click()
         time.sleep(0.1)
         digit_inputs[0].type(code, delay=50)
         filled = True
-    else:
-        # 兜底：找第一个可见 input，逐字输入（页面可能自动跳框）
-        print("兜底模式：在第一个可见输入框输入完整验证码")
-        for inp in digit_inputs:
-            try:
-                inp.click()
-                time.sleep(0.1)
-                inp.type(code, delay=50)
-                filled = True
-                break
-            except:
-                continue
 
     if not filled:
         print("无法填入验证码")
-        page.screenshot(path="mfa_fill_fail.png")
         return False
 
     time.sleep(1)
@@ -270,7 +396,6 @@ def handle_mfa(page):
             continue
 
     if not submit_clicked:
-        # 兜底：按回车
         print("未找到确认按钮，按回车")
         page.keyboard.press("Enter")
 
@@ -278,7 +403,6 @@ def handle_mfa(page):
     page.screenshot(path="mfa_after_submit.png")
     print(f"MFA提交后URL: {page.url}")
 
-    # 检查是否通过
     if "/mfa" in page.url:
         print("MFA 验证后仍在 MFA 页面，可能验证失败")
         return False
@@ -304,7 +428,7 @@ def main():
         """)
         page = context.new_page()
         try:
-            # 1. 打开面板，自动跳转 OAuth2 登录页
+            # 1. 打开面板
             print(f"打开面板: {PANEL_URL}")
             page.goto(PANEL_URL, timeout=30000, wait_until="domcontentloaded")
             for i in range(12):
@@ -315,7 +439,6 @@ def main():
             page.screenshot(path="step1_login.png")
             print(f"登录页URL: {page.url}")
 
-            # 打印input信息
             all_inputs = page.locator("input")
             input_count = all_inputs.count()
             print(f"页面共有 {input_count} 个input")
@@ -330,7 +453,7 @@ def main():
                 except:
                     pass
 
-            # 2. 定位用户名密码框
+            # 2. 定位用户名密码
             username_input = None
             password_input = page.locator("input[type='password']").first
             try:
@@ -368,7 +491,7 @@ def main():
                 browser.close()
                 sys.exit(1)
 
-            # 3. 输入用户名密码
+            # 3. 输入
             print("输入用户名...")
             username_input.click()
             time.sleep(0.3)
@@ -377,7 +500,6 @@ def main():
             uname_val = username_input.input_value()
             print(f"用户名框当前值: '{uname_val}'")
             if uname_val != USERNAME:
-                print("用户名填充不一致，尝试fill...")
                 username_input.fill(USERNAME)
                 time.sleep(0.3)
 
@@ -390,7 +512,7 @@ def main():
             print(f"密码框当前值长度: {len(pwd_val)}")
             page.screenshot(path="step1b_filled.png")
 
-            # 4. 点击登录按钮
+            # 4. 点击登录
             time.sleep(0.5)
             login_btn = None
             all_buttons = page.locator("button")
@@ -434,7 +556,7 @@ def main():
             page.screenshot(path="step2_after_login.png")
             print(f"点击后URL: {page.url}")
 
-            # 5. 处理登录时的极验验证码
+            # 5. 极验验证码
             try:
                 if page.locator(".geetest_wrap").is_visible():
                     print("登录需要极验验证码")
@@ -444,7 +566,7 @@ def main():
             except Exception as e:
                 print(f"检查验证码异常: {e}")
 
-            # 5.5 处理 MFA 二次验证（新增）
+            # 5.5 MFA 邮箱验证码
             if "/mfa" in page.url:
                 if not handle_mfa(page):
                     result_msg = "MFA 二次验证失败"
@@ -455,7 +577,7 @@ def main():
                     sys.exit(1)
                 time.sleep(3)
 
-            # 6. 等待登录成功跳回面板
+            # 6. 等待跳转
             print("等待登录跳转...")
             for i in range(20):
                 if "panel.chmlfrp.net" in page.url and "login" not in page.url and "qzhua" not in page.url:
@@ -466,14 +588,14 @@ def main():
             print(f"当前URL: {page.url}")
 
             if "qzhua" in page.url or "login" in page.url or "/mfa" in page.url:
-                result_msg = "登录失败，仍在认证页面（账号密码错误/MFA失败/页面报错）"
+                result_msg = "登录失败，仍在认证页面"
                 page.screenshot(path="error_login_fail.png")
                 print(result_msg)
                 send_email("ChmlFrp签到失败", result_msg)
                 browser.close()
                 sys.exit(1)
 
-            # 7. 找签到按钮
+            # 7. 签到
             print("寻找签到按钮...")
             sign_clicked = False
             for text in ["每日签到", "立即签到", "去签到", "签到领", "签到"]:
@@ -517,7 +639,7 @@ def main():
             time.sleep(3)
             page.screenshot(path="step4_after_sign.png")
 
-            # 8. 处理签到时的极验验证码
+            # 8. 签到极验
             try:
                 if page.locator(".geetest_wrap").is_visible():
                     print("签到需要极验验证")
