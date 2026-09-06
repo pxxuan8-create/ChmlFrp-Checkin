@@ -60,14 +60,14 @@ GitHub Actions (cron 0 1 * * * = 北京 9:00)
 
 4. **开启 QQ 邮箱 IMAP**：mail.qq.com → 设置 → 账户 → 开启 IMAP/SMTP → 生成授权码。
 5. **手动触发测试**：Actions → Run workflow → 等 2-3 分钟看 Success。
-6. **验证**：下载 Artifacts 的 screenshots，看 `result.png`；或登录面板账户页确认积分。
+6. **验证**：点开本次运行 → 展开"执行签到"步骤 → 看日志末尾文字输出（`签到成功！`/`今日已签到`）；或登录面板账户页确认积分；配置了 SMTP_* 还会收到结果邮件。
 
 ## 必须遵守的约束 / 规范
 
 - **账号密码等敏感信息只能放 GitHub Secrets**，严禁写入代码或公开仓库；脚本只通过环境变量读取。
 - 极验4代无法用纯 API 绕过，必须走浏览器自动化 + AI 视觉；识别失败要有重试与失败退出，不要假成功。
 - GitHub Actions 容器无中文字体，**必须安装 `fonts-noto-cjk`**，否则截图乱码（不影响逻辑但不可读）。
-- 每次修改脚本后，验证方式必须是从 Actions 真实运行 + 回读 `result.png`，不能只看 exit code。
+- 每次修改脚本后，验证方式必须是从 Actions 真实运行 + 回读日志末尾文字输出，不能只看 exit code。
 - 定时任务用 cron，注意 GitHub 会对 60 天不活动的 cron 自动暂停。
 
 ## 关键实现细节（踩坑点与解决方案）
@@ -75,7 +75,7 @@ GitHub Actions (cron 0 1 * * * = 北京 9:00)
 1. **登录按钮"登 录"含空格** → 匹配前去空格（`txt.replace(" ","")`），排除第三方（Apple/QQ/微信/Github/Google），候选按文字长度取最短。
 2. **MFA 二次验证** → 账号密码通过后若 URL 含 `/mfa`，走邮箱验证码：切"邮箱验证码"选项卡 → 读邮箱验证码 → 填入 → 点确认。
 3. **IMAP 中文搜索报 ASCII 编码错** → 禁用 `SUBJECT "验证"` 这类中文搜索条件；改 `search(None,"ALL")` 取最近 30 封在 Python 内过滤（主题/发件人关键词 + 10 分钟时效）。
-4. **Actions 截图乱码** → workflow 装 `fonts-noto-cjk`。
+4. **Actions 截图乱码**（当前已不上传截图；若恢复截图调试/上传）→ GitHub Actions 容器无中文字体，需在 workflow 装 `fonts-noto-cjk`，否则截图文字变方块。
 5. **弹窗遮罩拦截点击（n-modal-mask intercepts pointer events）** → 用 `page.evaluate` 移除 `.n-modal-mask` / `.n-modal-container` / `.n-overlay`。
 6. **"签到"与"签到信息"按钮混淆** → `get_by_text("签到", exact=True)` + 校验 `inner_text` 去空格 == "签到"。
 7. **workflow env 缩进错误** → `env:` 必须与 `name:`/`run:` 同级缩进，否则环境变量不注入。
@@ -92,12 +92,12 @@ GitHub Actions (cron 0 1 * * * = 北京 9:00)
 | `'ascii' codec can't encode...` | IMAP 中文搜索 | 改 ALL 全量 + Python 过滤 |
 | `n-modal-mask ... intercepts pointer events` | 弹窗遮罩挡点击 | JS 移除遮罩/弹窗 |
 | `未配置 TOTP_SECRET / 邮箱未配置` | env 没注入 | 检查 workflow env 缩进与 Secrets |
-| `签到结果不确定` | 签到后页面无成功关键字 | 下载截图确认；检查是否点了"立即签到/领取" |
+| `签到结果不确定` | 签到后页面无成功关键字 | 看日志中"签到后页面文字"段；检查是否点了"立即签到/领取" |
 | 截图全乱码 | 缺中文字体 | workflow 装 fonts-noto-cjk |
 | 60s内未收到验证码邮件 | 邮件读取失败 | 检查 IMAP 授权码、邮箱过滤规则、发件人 |
 
 ## 交付要求
 
 - 交付物：可运行的 GitHub 仓库（checkin.py + requirements.txt + workflow + README + 本 SKILL）。
-- 交付后必须让用户验证一次真实运行：手动 Run workflow → 下载 screenshots → 确认 `result.png` 显示签到成功且账户积分到账。
-- 若签到失败，要求用户提供 Actions 日志中"签到后页面文字"段与 `result.png`，据此精确定位（按钮文字/弹窗/验证码类型），再改脚本重跑。
+- 交付后必须让用户验证一次真实运行：手动 Run workflow → 展开"执行签到"步骤 → 日志末尾出现 `签到成功！`/`今日已签到` 且账户积分到账。
+- 若签到失败，要求用户提供 Actions 日志中"签到后页面文字"段（脚本会自动打印页面文字与可见按钮），据此精确定位（按钮文字/弹窗/验证码类型），再改脚本重跑。
