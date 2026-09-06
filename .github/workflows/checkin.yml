@@ -1,0 +1,44 @@
+name: ChmlFrp自动签到
+
+on:
+  schedule:
+    - cron: '0 1 * * *'   # 北京时间每天9:00（UTC 1:00）
+  workflow_dispatch:        # 支持手动触发
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: 设置Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: 安装依赖
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium
+      
+      - name: 执行签到
+        env:
+          CHML_USERNAME: ${{ secrets.CHML_USERNAME }}
+          CHML_PASSWORD: ${{ secrets.CHML_PASSWORD }}
+          CHML_URL: ${{ secrets.CHML_URL }}
+          AI_BASE_URL: ${{ secrets.AI_BASE_URL }}
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
+          AI_MODEL: ${{ secrets.AI_MODEL }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SMTP_TO: ${{ secrets.SMTP_TO }}
+        run: python checkin.py
+      
+      - name: 上传截图
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: '*.png'
+          retention-days: 7
