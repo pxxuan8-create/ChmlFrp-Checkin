@@ -1,3 +1,21 @@
+# -*- coding: utf-8 -*-
+"""
+ChmlFrp 每日自动签到脚本（GitHub Actions 版）
+================================================
+流程：打开面板 -> 账号密码登录 -> OAuth2 MFA 邮箱验证码 -> 进入面板 -> 点击签到 -> 处理极验 -> 完成
+
+依赖环境变量（由 GitHub Actions Secrets 注入）：
+  CHML_USERNAME         ChmlFrp 登录用户名/邮箱
+  CHML_PASSWORD         ChmlFrp 登录密码
+  CHML_URL              面板地址，默认 https://panel.chmlfrp.net/home
+  EMAIL_ADDRESS         QQ 邮箱地址（用于接收 MFA 验证码）
+  EMAIL_IMAP_PASSWORD   QQ 邮箱 IMAP 授权码（不是 QQ 密码）
+  AI_BASE_URL           通义千问 OpenAI 兼容接口地址
+  AI_API_KEY            通义千问 API Key
+  AI_MODEL              AI 视觉模型，默认 qwen-vl-plus
+  SMTP_HOST/SMTP_USER/SMTP_PASS/SMTP_TO    （可选）邮件通知
+"""
+
 import os, json, time, base64, requests, sys, re
 import imaplib, email
 from email.header import decode_header
@@ -18,6 +36,7 @@ SMTP_TO = os.environ.get("SMTP_TO", "")
 
 
 def ai_analyze_image(image_b64, prompt):
+    """调用通义千问视觉模型分析极验验证码截图"""
     headers = {"Authorization": f"Bearer {AI_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": AI_MODEL,
@@ -39,6 +58,7 @@ def ai_analyze_image(image_b64, prompt):
 
 
 def send_email(subject, body):
+    """可选：邮件结果通知"""
     if not all([SMTP_HOST, SMTP_USER, SMTP_PASS, SMTP_TO]):
         print("邮件未配置，跳过通知")
         return
@@ -57,7 +77,11 @@ def send_email(subject, body):
 
 
 def fetch_email_code():
-    """从QQ邮箱读取最新的QZhua/ChmlFrp验证邮件，提取6位验证码"""
+    """
+    从 QQ 邮箱读取最新的 QZhua/ChmlFrp 验证邮件，提取 6 位验证码。
+    - 不用 IMAP 中文搜索（会触发 ASCII 编码错误），直接取最近 30 封在 Python 里过滤。
+    - 只认最近 10 分钟内的验证邮件。
+    """
     if not EMAIL_ADDRESS or not EMAIL_IMAP_PASSWORD:
         print("邮箱未配置")
         return None
@@ -78,7 +102,7 @@ def fetch_email_code():
 
         ids = data[0].split()
         latest_ids = ids[-30:] if len(ids) >= 30 else ids
-        latest_ids.reverse()
+        latest_ids.reverse()  # 最新的在前
 
         import datetime
         from email.utils import parsedate_to_datetime
@@ -89,6 +113,7 @@ def fetch_email_code():
                 continue
             msg = email.message_from_bytes(msg_data[0][1])
 
+            # 解析主题（兼容多种编码）
             subject = ""
             subj_parts = decode_header(msg["Subject"])
             for part, enc in subj_parts:
@@ -103,12 +128,14 @@ def fetch_email_code():
             from_addr = msg.get("From", "")
             from_lower = from_addr.lower()
 
+            # Python 里过滤：主题含验证/验证码/code，或发件人含 qzhua/chmlfrp
             is_verify_email = any(k in subject for k in ["验证", "验证码", "code", "Code", "CODE", "动态码"]) or \
                               any(k in from_lower for k in ["qzhua", "chmlfrp"])
 
             if not is_verify_email:
                 continue
 
+            # 只看最近 10 分钟的邮件
             try:
                 msg_date = parsedate_to_datetime(msg["Date"])
                 if (datetime.datetime.now(datetime.timezone.utc) - msg_date).total_seconds() > 600:
@@ -118,6 +145,7 @@ def fetch_email_code():
 
             print(f"找到候选邮件: 主题='{subject}', 发件人='{from_addr}'")
 
+            # 提取正文
             body = ""
             if msg.is_multipart():
                 for part in msg.walk():
@@ -167,6 +195,10 @@ def fetch_email_code():
 
 
 def solve_geetest(page):
+    """
+    处理极验 4 代验证码。
+    用通义千问视觉模型截图识别类型，再模拟操作（滑块/点选/仅点击按钮）。
+    """
     for attempt in range(3):
         print(f"极验验证尝试 {attempt+1}/3")
         time.sleep(2)
@@ -245,7 +277,11 @@ def solve_geetest(page):
 
 
 def handle_mfa(page):
-    """处理 MFA 二次验证：邮箱验证码方式"""
+    """
+    处理 OAuth2 MFA 二次验证（邮箱验证码方式）。
+    优化：切换"邮箱验证码"模式后，若系统已自动发送验证码则直接读邮箱，
+    读不到才点"发送/重新发送"，避免每次重复发两封邮件。
+    """
     if "/mfa" not in page.url:
         print("未检测到 MFA 页面，跳过")
         return True
@@ -258,6 +294,7 @@ def handle_mfa(page):
     time.sleep(3)
     page.screenshot(path="mfa_page.png")
 
+    # 打印页面元素（调试用）
     all_inputs = page.locator("input")
     print(f"MFA页面共有 {all_inputs.count()} 个input")
     for i in range(all_inputs.count()):
@@ -282,6 +319,7 @@ def handle_mfa(page):
         except:
             pass
 
+    # 切换到邮箱验证码模式
     email_mode = False
     for text in ["邮箱验证码", "邮箱", "Email", "EMAIL"]:
         try:
@@ -302,39 +340,48 @@ def handle_mfa(page):
     if not email_mode:
         print("未找到邮箱验证码选项，尝试直接发送")
 
-    send_clicked = False
-    for text in ["发送验证码", "获取验证码", "发送", "重新发送", "获取"]:
-        try:
-            btn = page.get_by_text(text, exact=False)
-            if btn.count() > 0:
-                for i in range(btn.count()):
-                    if btn.nth(i).is_visible():
-                        btn.nth(i).click()
-                        print(f"点击了'{text}'按钮")
-                        send_clicked = True
-                        time.sleep(2)
+    # 先等几秒，看切换模式是否已自动发送验证码（避免重复发）
+    print("等待系统自动发送验证码...")
+    time.sleep(5)
+    code = fetch_email_code()
+    if code:
+        print("系统已自动发送验证码，无需再点发送")
+    else:
+        # 没自动发送，才点击"发送/重新发送"
+        print("未检测到自动发送，点击发送按钮...")
+        send_clicked = False
+        for text in ["发送验证码", "获取验证码", "发送", "重新发送", "获取"]:
+            try:
+                btn = page.get_by_text(text, exact=False)
+                if btn.count() > 0:
+                    for i in range(btn.count()):
+                        if btn.nth(i).is_visible():
+                            btn.nth(i).click()
+                            print(f"点击了'{text}'按钮")
+                            send_clicked = True
+                            time.sleep(2)
+                            break
+                    if send_clicked:
                         break
-                if send_clicked:
-                    break
-        except:
-            continue
+            except:
+                continue
+        if not send_clicked:
+            print("未找到发送按钮，可能已自动发送")
 
-    if not send_clicked:
-        print("未找到发送按钮，可能已自动发送")
-
-    code = None
-    for attempt in range(12):
-        print(f"等待验证码邮件... ({attempt+1}/12)")
-        code = fetch_email_code()
-        if code:
-            break
-        time.sleep(5)
+        # 等待邮件并读取验证码（最多等 60 秒，每 5 秒查一次）
+        for attempt in range(12):
+            print(f"等待验证码邮件... ({attempt+1}/12)")
+            code = fetch_email_code()
+            if code:
+                break
+            time.sleep(5)
 
     if not code:
         print("60秒内未收到验证码邮件")
         page.screenshot(path="mfa_no_email.png")
         return False
 
+    # 填入验证码
     time.sleep(1)
     all_inputs = page.locator("input")
     digit_inputs = []
@@ -376,6 +423,7 @@ def handle_mfa(page):
     time.sleep(1)
     page.screenshot(path="mfa_filled.png")
 
+    # 点击确认/提交按钮
     submit_clicked = False
     for text in ["确认", "验证", "提交", "登录", "继续", "下一步", "Verify", "Submit"]:
         try:
@@ -489,7 +537,7 @@ def main():
                 browser.close()
                 sys.exit(1)
 
-            # 3. 输入
+            # 3. 输入用户名密码
             print("输入用户名...")
             username_input.click()
             time.sleep(0.3)
@@ -510,7 +558,7 @@ def main():
             print(f"密码框当前值长度: {len(pwd_val)}")
             page.screenshot(path="step1b_filled.png")
 
-            # 4. 点击登录
+            # 4. 点击登录按钮（排除第三方登录，优先纯"登录"文字）
             time.sleep(0.5)
             login_btn = None
             all_buttons = page.locator("button")
@@ -554,7 +602,7 @@ def main():
             page.screenshot(path="step2_after_login.png")
             print(f"点击后URL: {page.url}")
 
-            # 5. 极验验证码
+            # 5. 登录时极验验证码
             try:
                 if page.locator(".geetest_wrap").is_visible():
                     print("登录需要极验验证码")
