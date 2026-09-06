@@ -2,7 +2,10 @@
 """
 ChmlFrp 每日自动签到脚本（GitHub Actions 版）
 ================================================
-流程：打开面板 -> 账号密码登录 -> OAuth2 MFA 邮箱验证码 -> 进入面板 -> 点击签到 -> 处理极验 -> 完成
+流程：打开面板 -> 账号密码登录 -> OAuth2 MFA 邮箱验证码 -> 进入面板
+      -> 读"签到信息"弹窗(签到前积分/次数) -> 点击签到
+      -> 读签到结果弹窗(本次获得积分) -> 再读"签到信息"(签到后积分/次数)
+      -> 组装邮件 -> SMTP 发送到指定邮箱
 
 依赖环境变量（由 GitHub Actions Secrets 注入）：
   CHML_USERNAME         ChmlFrp 登录用户名/邮箱
@@ -13,12 +16,16 @@ ChmlFrp 每日自动签到脚本（GitHub Actions 版）
   AI_BASE_URL           通义千问 OpenAI 兼容接口地址
   AI_API_KEY            通义千问 API Key
   AI_MODEL              AI 视觉模型，默认 qwen-vl-plus
-  SMTP_HOST/SMTP_USER/SMTP_PASS/SMTP_TO    （可选）邮件通知
+  SMTP_HOST             邮件通知 SMTP 服务器（如 smtp.qq.com）
+  SMTP_USER             发件邮箱账号（QQ 邮箱）
+  SMTP_PASS             发件邮箱 SMTP 授权码
+  SMTP_TO               收件邮箱（签到结果通知）
 """
 
 import os, json, time, base64, requests, sys, re
 import imaplib, email
 from email.header import decode_header
+from datetime import datetime, timezone, timedelta
 from playwright.sync_api import sync_playwright
 
 USERNAME = os.environ.get("CHML_USERNAME", "")
@@ -33,6 +40,13 @@ SMTP_HOST = os.environ.get("SMTP_HOST", "")
 SMTP_USER = os.environ.get("SMTP_USER", "")
 SMTP_PASS = os.environ.get("SMTP_PASS", "")
 SMTP_TO = os.environ.get("SMTP_TO", "")
+
+BJ_TZ = timezone(timedelta(hours=8))
+
+
+def bj_now():
+    """北京时间 yyyy-MM-dd HH:mm:ss"""
+    return datetime.now(BJ_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def ai_analyze_image(image_b64, prompt):
@@ -58,22 +72,26 @@ def ai_analyze_image(image_b64, prompt):
 
 
 def send_email(subject, body):
-    """可选：邮件结果通知"""
+    """SMTP 发送签到结果邮件（QQ 邮箱发件，465 SSL）"""
     if not all([SMTP_HOST, SMTP_USER, SMTP_PASS, SMTP_TO]):
-        print("邮件未配置，跳过通知")
-        return
+        print(f"[邮件] 未完整配置 SMTP，本次不发送。收件人应为: {SMTP_TO}")
+        print(f"[邮件] 邮件主题: {subject}")
+        print(f"[邮件] 邮件内容:\n{body}")
+        return False
     import smtplib
     from email.mime.text import MIMEText
     msg = MIMEText(body, "plain", "utf-8")
     msg["Subject"], msg["From"], msg["To"] = subject, SMTP_USER, SMTP_TO
     try:
-        server = smtplib.SMTP_SSL(SMTP_HOST, 465)
+        server = smtplib.SMTP_SSL(SMTP_HOST, 465, timeout=30)
         server.login(SMTP_USER, SMTP_PASS)
         server.sendmail(SMTP_USER, SMTP_TO, msg.as_string())
         server.quit()
-        print("邮件通知已发送")
+        print(f"[邮件] 已发送到 {SMTP_TO}")
+        return True
     except Exception as e:
-        print(f"邮件发送失败: {e}")
+        print(f"[邮件] 发送失败: {e}")
+        return False
 
 
 def fetch_email_code():
@@ -104,7 +122,7 @@ def fetch_email_code():
         latest_ids = ids[-30:] if len(ids) >= 30 else ids
         latest_ids.reverse()  # 最新的在前
 
-        import datetime
+        import datetime as _dt
         from email.utils import parsedate_to_datetime
 
         for eid in latest_ids:
@@ -113,7 +131,6 @@ def fetch_email_code():
                 continue
             msg = email.message_from_bytes(msg_data[0][1])
 
-            # 解析主题（兼容多种编码）
             subject = ""
             subj_parts = decode_header(msg["Subject"])
             for part, enc in subj_parts:
@@ -128,24 +145,21 @@ def fetch_email_code():
             from_addr = msg.get("From", "")
             from_lower = from_addr.lower()
 
-            # Python 里过滤：主题含验证/验证码/code，或发件人含 qzhua/chmlfrp
             is_verify_email = any(k in subject for k in ["验证", "验证码", "code", "Code", "CODE", "动态码"]) or \
                               any(k in from_lower for k in ["qzhua", "chmlfrp"])
 
             if not is_verify_email:
                 continue
 
-            # 只看最近 10 分钟的邮件
             try:
                 msg_date = parsedate_to_datetime(msg["Date"])
-                if (datetime.datetime.now(datetime.timezone.utc) - msg_date).total_seconds() > 600:
+                if (_dt.datetime.now(_dt.timezone.utc) - msg_date).total_seconds() > 600:
                     continue
             except:
                 pass
 
-            print(f"找到候选邮件: 主题='{subject}', 发件人='{from_addr}'")
+            print(f"找到候选邮件: 主题='{subject}'")
 
-            # 提取正文
             body = ""
             if msg.is_multipart():
                 for part in msg.walk():
@@ -189,16 +203,11 @@ def fetch_email_code():
 
     except Exception as e:
         print(f"读取邮箱失败: {e}")
-        import traceback
-        traceback.print_exc()
         return None
 
 
 def solve_geetest(page):
-    """
-    处理极验 4 代验证码。
-    用通义千问视觉模型截图识别类型，再模拟操作（滑块/点选/仅点击按钮）。
-    """
+    """处理极验 4 代验证码（AI 视觉识别 + 模拟操作）"""
     for attempt in range(3):
         print(f"极验验证尝试 {attempt+1}/3")
         time.sleep(2)
@@ -292,32 +301,6 @@ def handle_mfa(page):
 
     print("检测到 MFA 页面，使用邮箱验证码方式")
     time.sleep(3)
-    page.screenshot(path="mfa_page.png")
-
-    # 打印页面元素（调试用）
-    all_inputs = page.locator("input")
-    print(f"MFA页面共有 {all_inputs.count()} 个input")
-    for i in range(all_inputs.count()):
-        try:
-            inp = all_inputs.nth(i)
-            itype = inp.get_attribute("type") or "text"
-            iname = inp.get_attribute("name") or ""
-            iplaceholder = inp.get_attribute("placeholder") or ""
-            visible = inp.is_visible()
-            print(f"  input[{i}]: type={itype}, name={iname}, placeholder={iplaceholder}, visible={visible}")
-        except:
-            pass
-
-    all_buttons = page.locator("button")
-    print(f"MFA页面共有 {all_buttons.count()} 个button")
-    for i in range(all_buttons.count()):
-        try:
-            btn = all_buttons.nth(i)
-            if btn.is_visible():
-                txt = btn.inner_text(timeout=500)
-                print(f"  button[{i}]: text='{txt[:80]}'")
-        except:
-            pass
 
     # 切换到邮箱验证码模式
     email_mode = False
@@ -337,9 +320,6 @@ def handle_mfa(page):
         except:
             continue
 
-    if not email_mode:
-        print("未找到邮箱验证码选项，尝试直接发送")
-
     # 先等几秒，看切换模式是否已自动发送验证码（避免重复发）
     print("等待系统自动发送验证码...")
     time.sleep(5)
@@ -347,7 +327,6 @@ def handle_mfa(page):
     if code:
         print("系统已自动发送验证码，无需再点发送")
     else:
-        # 没自动发送，才点击"发送/重新发送"
         print("未检测到自动发送，点击发送按钮...")
         send_clicked = False
         for text in ["发送验证码", "获取验证码", "发送", "重新发送", "获取"]:
@@ -368,7 +347,6 @@ def handle_mfa(page):
         if not send_clicked:
             print("未找到发送按钮，可能已自动发送")
 
-        # 等待邮件并读取验证码（最多等 60 秒，每 5 秒查一次）
         for attempt in range(12):
             print(f"等待验证码邮件... ({attempt+1}/12)")
             code = fetch_email_code()
@@ -378,7 +356,6 @@ def handle_mfa(page):
 
     if not code:
         print("60秒内未收到验证码邮件")
-        page.screenshot(path="mfa_no_email.png")
         return False
 
     # 填入验证码
@@ -421,7 +398,6 @@ def handle_mfa(page):
         return False
 
     time.sleep(1)
-    page.screenshot(path="mfa_filled.png")
 
     # 点击确认/提交按钮
     submit_clicked = False
@@ -445,7 +421,6 @@ def handle_mfa(page):
         page.keyboard.press("Enter")
 
     time.sleep(5)
-    page.screenshot(path="mfa_after_submit.png")
     print(f"MFA提交后URL: {page.url}")
 
     if "/mfa" in page.url:
@@ -455,8 +430,108 @@ def handle_mfa(page):
     return True
 
 
+def remove_modal_overlays(page):
+    """用 JS 移除 Naive UI 弹窗/遮罩，避免拦截点击"""
+    try:
+        removed = page.evaluate("""() => {
+            let n = 0;
+            document.querySelectorAll('.n-modal-mask').forEach(e => { e.remove(); n++; });
+            document.querySelectorAll('.n-modal-container').forEach(e => { e.remove(); n++; });
+            document.querySelectorAll('.n-overlay, .n-drawer-mask, .n-drawer').forEach(e => { e.remove(); n++; });
+            return n;
+        }""")
+        print(f"JS移除弹窗/遮罩: {removed}个")
+        time.sleep(1)
+    except Exception as e:
+        print(f"JS移除弹窗异常: {e}")
+
+
+def close_popover(page):
+    """关闭当前可能打开的 popover/弹窗：按 Escape + 点击页面空白处"""
+    try:
+        page.keyboard.press("Escape")
+        time.sleep(0.5)
+    except:
+        pass
+    try:
+        # 点击页面中央空白区域关闭
+        page.mouse.click(400, 250)
+        time.sleep(0.5)
+    except:
+        pass
+
+
+def get_sign_info(page):
+    """
+    打开"签到信息"弹窗（统计信息），读取：
+      - 累计签到积分（当前总积分，以此为准）
+      - 累计签到次数
+      - 上次签到时间
+    返回 dict；读取失败返回 None。
+    """
+    info = None
+    try:
+        # 先移除可能遮挡的弹窗
+        remove_modal_overlays(page)
+        time.sleep(0.5)
+        btn = page.get_by_text("签到信息", exact=True).first
+        btn.click(timeout=5000)
+        time.sleep(1.5)
+        body = page.inner_text("body")
+        m_pts = re.search(r"累计签到积分[：:]\s*(\d+)", body)
+        m_cnt = re.search(r"累计签到次数[：:]\s*(\d+)", body)
+        m_time = re.search(r"上次签到时间[：:]\s*([\d\-]+)", body)
+        info = {
+            "points": m_pts.group(1) if m_pts else None,
+            "count": m_cnt.group(1) if m_cnt else None,
+            "last_sign": m_time.group(1) if m_time else None,
+        }
+        print(f"签到信息: 累计积分={info['points']}, 累计次数={info['count']}, 上次签到={info['last_sign']}")
+    except Exception as e:
+        print(f"读取签到信息失败: {e}")
+    finally:
+        close_popover(page)
+    return info
+
+
+def parse_sign_reward(page):
+    """
+    解析签到结果弹窗，返回 (状态, 获得积分, 备注)
+      状态: 'success' 签到成功 / 'already' 今日已签到 / 'failed' 未签到
+    """
+    status, reward, note = "failed", 0, ""
+    try:
+        body = page.inner_text("body")
+        m_reward = re.search(r"本次签到获得(\d+)点积分", body)
+        m_ok = re.search(r"签到成功", body)
+        m_already = re.search(r"今日已签|已经签到|今日已签到", body)
+
+        if m_reward:
+            reward = int(m_reward.group(1))
+        if m_ok:
+            status = "success"
+            note = f"本次签到获得{reward}点积分"
+        elif m_already:
+            status = "already"
+            reward = 0
+            note = "今日已签到"
+        else:
+            status = "failed"
+            note = "未检测到签到成功弹窗"
+        print(f"签到结果: status={status}, reward={reward}, note={note}")
+    except Exception as e:
+        print(f"解析签到结果异常: {e}")
+    return status, reward, note
+
+
 def main():
     result_msg, success = "", False
+    sign_before = {"points": None, "count": None, "last_sign": None}
+    sign_after = {"points": None, "count": None, "last_sign": None}
+    reward = 0
+    sign_status = "failed"
+    note = ""
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True, args=[
             "--no-sandbox","--disable-blink-features=AutomationControlled","--disable-dev-shm-usage"
@@ -482,24 +557,11 @@ def main():
                     break
                 time.sleep(1)
             time.sleep(4)
-            page.screenshot(path="step1_login.png")
             print(f"登录页URL: {page.url}")
 
+            # 2. 登录
             all_inputs = page.locator("input")
             input_count = all_inputs.count()
-            print(f"页面共有 {input_count} 个input")
-            for i in range(input_count):
-                try:
-                    inp = all_inputs.nth(i)
-                    itype = inp.get_attribute("type") or "text"
-                    iname = inp.get_attribute("name") or ""
-                    iplaceholder = inp.get_attribute("placeholder") or ""
-                    visible = inp.is_visible()
-                    print(f"  input[{i}]: type={itype}, name={iname}, placeholder={iplaceholder}, visible={visible}")
-                except:
-                    pass
-
-            # 2. 定位用户名密码
             username_input = None
             password_input = page.locator("input[type='password']").first
             try:
@@ -524,7 +586,6 @@ def main():
                         inp = all_inputs.nth(i)
                         if inp.is_visible():
                             username_input = inp
-                            print(f"兜底用第一个可见input[{i}]")
                             break
                     except:
                         continue
@@ -533,19 +594,15 @@ def main():
                 result_msg = "未找到用户名或密码输入框"
                 page.screenshot(path="error_no_input.png")
                 print(result_msg)
-                send_email("ChmlFrp签到失败", result_msg)
                 browser.close()
                 sys.exit(1)
 
-            # 3. 输入用户名密码
             print("输入用户名...")
             username_input.click()
             time.sleep(0.3)
             username_input.type(USERNAME, delay=50)
             time.sleep(0.5)
-            uname_val = username_input.input_value()
-            print(f"用户名框当前值: '{uname_val}'")
-            if uname_val != USERNAME:
+            if username_input.input_value() != USERNAME:
                 username_input.fill(USERNAME)
                 time.sleep(0.3)
 
@@ -554,16 +611,12 @@ def main():
             time.sleep(0.3)
             password_input.type(PASSWORD, delay=50)
             time.sleep(0.5)
-            pwd_val = password_input.input_value()
-            print(f"密码框当前值长度: {len(pwd_val)}")
-            page.screenshot(path="step1b_filled.png")
+            print(f"密码框当前值长度: {len(password_input.input_value())}")
 
-            # 4. 点击登录按钮（排除第三方登录，优先纯"登录"文字）
-            time.sleep(0.5)
+            # 点击登录（排除第三方）
             login_btn = None
             all_buttons = page.locator("button")
             btn_count = all_buttons.count()
-            print(f"页面共有 {btn_count} 个button")
             candidates = []
             for i in range(btn_count):
                 try:
@@ -571,7 +624,6 @@ def main():
                     if btn.is_visible():
                         txt = btn.inner_text(timeout=500).strip()
                         txt_nospace = txt.replace(" ", "").replace("\u3000", "")
-                        print(f"  button[{i}]: text='{txt}'")
                         is_third_party = any(k in txt for k in ["Apple", "QQ", "微信", "WeChat", "Github", "Google", "第三方"])
                         if not is_third_party and ("登录" in txt_nospace or "登陆" in txt_nospace or "Sign" in txt):
                             candidates.append((i, btn, len(txt)))
@@ -587,7 +639,6 @@ def main():
                         btn = all_buttons.nth(i)
                         if btn.is_visible():
                             login_btn = btn
-                            print(f"兜底用第一个可见button[{i}]")
                             break
                     except:
                         continue
@@ -599,100 +650,84 @@ def main():
                 login_btn.click()
 
             time.sleep(6)
-            page.screenshot(path="step2_after_login.png")
             print(f"点击后URL: {page.url}")
 
-            # 5. 登录时极验验证码
+            # 3. 登录时极验验证码
             try:
                 if page.locator(".geetest_wrap").is_visible():
                     print("登录需要极验验证码")
                     solve_geetest(page)
                     time.sleep(3)
-                    page.screenshot(path="step2b_after_captcha.png")
             except Exception as e:
                 print(f"检查验证码异常: {e}")
 
-            # 5.5 MFA 邮箱验证码
+            # 4. MFA 邮箱验证码
             if "/mfa" in page.url:
                 if not handle_mfa(page):
                     result_msg = "MFA 二次验证失败"
                     page.screenshot(path="error_mfa.png")
                     print(result_msg)
-                    send_email("ChmlFrp签到失败", result_msg)
+                    send_email(f"【ChmlFrp自动签到】{bj_now()} 失败", build_mail_body(False, bj_now(), sign_before, 0, sign_after, result_msg))
                     browser.close()
                     sys.exit(1)
                 time.sleep(3)
 
-            # 6. 等待登录成功跳回面板
+            # 5. 等待登录跳回面板
             print("等待登录跳转...")
             for i in range(20):
                 if "panel.chmlfrp.net" in page.url and "login" not in page.url and "qzhua" not in page.url:
                     break
                 time.sleep(1)
             time.sleep(3)
-            page.screenshot(path="step3_panel.png")
             print(f"当前URL: {page.url}")
 
             if "qzhua" in page.url or "login" in page.url or "/mfa" in page.url:
                 result_msg = "登录失败，仍在认证页面"
                 page.screenshot(path="error_login_fail.png")
                 print(result_msg)
-                send_email("ChmlFrp签到失败", result_msg)
+                send_email(f"【ChmlFrp自动签到】{bj_now()} 失败", build_mail_body(False, bj_now(), sign_before, 0, sign_after, result_msg))
                 browser.close()
                 sys.exit(1)
 
-            # 7. 等待面板加载
-            print("等待面板加载并寻找签到按钮...")
-            sign_clicked = False
+            # 6. 移除面板弹窗，等面板加载
+            print("面板已进入，移除弹窗...")
+            remove_modal_overlays(page)
 
-            # 7a. 用JS强制移除登录后的公告弹窗/遮罩（Naive UI modal 会拦截点击）
-            try:
-                removed = page.evaluate("""() => {
-                    let n = 0;
-                    document.querySelectorAll('.n-modal-mask').forEach(e => { e.remove(); n++; });
-                    document.querySelectorAll('.n-modal-container').forEach(e => { e.remove(); n++; });
-                    document.querySelectorAll('.n-overlay, .n-drawer-mask').forEach(e => { e.remove(); n++; });
-                    return n;
-                }""")
-                print(f"JS移除弹窗/遮罩: {removed}个")
-                time.sleep(1)
-            except Exception as e:
-                print(f"JS移除弹窗异常: {e}")
-
-            # 轮询等待"签到"按钮出现（面板是SPA，最多等30秒）
-            sign_btn = None
+            # 等签到按钮出现
             for wait_i in range(15):
                 try:
-                    for sel in [page.get_by_text("签到", exact=True), page.get_by_text("签 到", exact=True)]:
-                        cnt = sel.count()
-                        for i in range(cnt):
-                            try:
-                                el = sel.nth(i)
-                                if el.is_visible():
-                                    t = el.inner_text(timeout=300).strip()
-                                    if t.replace(" ", "") == "签到":
-                                        sign_btn = el
-                                        break
-                            except:
-                                pass
-                        if sign_btn:
-                            break
-                    if sign_btn:
-                        print(f"找到签到按钮: '{sign_btn.inner_text().strip()}'")
+                    if page.get_by_text("签到", exact=True).count() > 0:
+                        print("签到按钮已出现")
                         break
                 except:
                     pass
                 time.sleep(2)
 
-            if not sign_btn:
-                print("未直接找到签到按钮，枚举页面含'签'的文字：")
-                try:
-                    body_txt = page.inner_text("body")
-                    for line in body_txt.split("\n"):
-                        if "签" in line:
-                            print(f"  [文本] {line.strip()[:50]}")
-                except:
-                    pass
+            # 7. 【签到前】读签到信息弹窗（签到前总积分 / 累计次数）
+            print("===== 读取签到前信息 =====")
+            sign_before = get_sign_info(page)
+
+            # 8. 点击签到
+            print("===== 点击签到 =====")
+            sign_clicked = False
+            sign_btn = None
+            try:
+                for sel in [page.get_by_text("签到", exact=True), page.get_by_text("签 到", exact=True)]:
+                    cnt = sel.count()
+                    for i in range(cnt):
+                        try:
+                            el = sel.nth(i)
+                            if el.is_visible():
+                                t = el.inner_text(timeout=300).strip()
+                                if t.replace(" ", "") == "签到":
+                                    sign_btn = el
+                                    break
+                        except:
+                            pass
+                    if sign_btn:
+                        break
+            except:
+                pass
 
             if sign_btn:
                 try:
@@ -712,76 +747,54 @@ def main():
                 result_msg = "未找到签到按钮"
                 page.screenshot(path="error_no_sign.png")
                 print(result_msg)
-                send_email("ChmlFrp签到失败", result_msg)
+                send_email(f"【ChmlFrp自动签到】{bj_now()} 失败", build_mail_body(False, bj_now(), sign_before, 0, sign_after, result_msg))
                 browser.close()
                 sys.exit(1)
 
-            # 7b. 等签到弹窗出现，打印页面文字和所有可见按钮（定位签到动作按钮）
+            # 9. 等待签到结果（含极验）
             time.sleep(3)
-            print("===== 签到后页面文字(前1200字符) =====")
-            try:
-                body_txt = page.inner_text("body")
-                print(body_txt[:1200])
-                print("===== 结束 =====")
-            except:
-                pass
-            try:
-                all_btns = page.locator("button")
-                print(f"===== 页面可见按钮({all_btns.count()}) =====")
-                for i in range(all_btns.count()):
-                    try:
-                        if all_btns.nth(i).is_visible():
-                            t = all_btns.nth(i).inner_text(timeout=300).strip()
-                            if t:
-                                print(f"  [按钮] '{t[:40]}'")
-                    except:
-                        pass
-            except:
-                pass
-
-            # 7c. 点击签到弹窗里的动作按钮（立即签到/领取积分/确认签到）
-            for text in ["立即签到", "签到领积分", "领取积分", "确认签到", "签到成功", "签到"]:
-                try:
-                    btn = page.get_by_text(text, exact=False)
-                    if btn.count() > 0:
-                        for i in range(btn.count()):
-                            try:
-                                if btn.nth(i).is_visible():
-                                    t = btn.nth(i).inner_text(timeout=300).strip()
-                                    btn.nth(i).click(timeout=1500)
-                                    print(f"点击了'{t}'")
-                                    time.sleep(2)
-                                    break
-                            except:
-                                pass
-                        break
-                except:
-                    continue
-
-            # 8. 处理签到时的极验验证码
             try:
                 if page.locator(".geetest_wrap").is_visible():
                     print("签到需要极验验证")
                     if not solve_geetest(page):
                         result_msg = "极验验证失败"
                         page.screenshot(path="geetest_fail.png")
-                        send_email("ChmlFrp签到失败", result_msg)
+                        print(result_msg)
+                        send_email(f"【ChmlFrp自动签到】{bj_now()} 失败", build_mail_body(False, bj_now(), sign_before, 0, sign_after, result_msg))
                         browser.close()
                         sys.exit(1)
             except:
                 print("未检测到极验验证码")
 
             time.sleep(3)
-            page.screenshot(path="result.png")
-            result_text = page.inner_text("body")
+            sign_status, reward, note = parse_sign_reward(page)
+            # 关闭签到结果弹窗
+            close_popover(page)
+            time.sleep(1)
 
-            if any(k in result_text for k in ["签到成功","已签到","签到完成","获得积分","积分+"]):
-                success, result_msg = True, "签到成功！"
-            elif "今日已签" in result_text or "已经签到" in result_text:
-                success, result_msg = True, "今日已签到"
+            # 10. 【签到后】再读签到信息弹窗（签到后总积分 / 累计次数）
+            print("===== 读取签到后信息 =====")
+            sign_after = get_sign_info(page)
+
+            # 11. 判定成功
+            if sign_status in ("success", "already"):
+                success = True
+                if sign_status == "success":
+                    result_msg = "签到成功"
+                else:
+                    result_msg = "今日已签到"
             else:
-                result_msg = "签到结果不确定，请查看截图"
+                result_msg = "签到失败（未检测到签到成功）"
             print(result_msg)
+
+            # 12. 组装并发送邮件
+            body = build_mail_body(success, bj_now(), sign_before, reward, sign_after, result_msg + ("，"+note if note else ""))
+            subject = f"【ChmlFrp自动签到】{bj_now()} {'成功' if success else '失败'}"
+            print("===== 邮件内容 =====")
+            print(subject)
+            print(body)
+            print("=====================")
+            send_email(subject, body)
 
         except Exception as e:
             result_msg = f"脚本异常: {str(e)}"
@@ -792,13 +805,46 @@ def main():
                 page.screenshot(path="error.png")
             except:
                 pass
+            body = build_mail_body(False, bj_now(), sign_before, 0, sign_after, result_msg)
+            send_email(f"【ChmlFrp自动签到】{bj_now()} 失败", body)
 
         browser.close()
 
-    status = "成功" if success else "失败"
-    send_email(f"ChmlFrp每日签到 - {status}", result_msg)
     if not success:
         sys.exit(1)
+
+
+def build_mail_body(success, ts, before, reward, after, note=""):
+    """
+    组装邮件正文。
+      success: bool 是否成功
+      ts: 北京时间字符串
+      before: 签到前信息 dict（points/count）
+      reward: 本次获得积分
+      after: 签到后信息 dict（points/count）
+      note: 附加说明
+    """
+    b_points = before.get("points") if before else None
+    b_count = before.get("count") if before else None
+    a_points = after.get("points") if after else None
+    a_count = after.get("count") if after else None
+
+    status = "成功" if success else "失败"
+    lines = []
+    lines.append("=" * 30)
+    lines.append(f"ChmlFrp 每日自动签到")
+    lines.append("=" * 30)
+    lines.append(f"签到状态：{status}")
+    lines.append(f"签到时间：{ts}")
+    lines.append(f"签到前总积分：{b_points if b_points is not None else '--'}")
+    lines.append(f"本次签到获得：{reward} 积分")
+    lines.append(f"累计签到次数：{a_count if a_count is not None else (b_count if b_count is not None else '--')} 次")
+    lines.append(f"签到后总积分：{a_points if a_points is not None else '--'}")
+    if note:
+        lines.append(f"备注：{note}")
+    lines.append("")
+    lines.append("(积分数据以面板'签到信息'统计为准)")
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":
