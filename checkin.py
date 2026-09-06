@@ -589,7 +589,7 @@ def main():
                     sys.exit(1)
                 time.sleep(3)
 
-            # 6. 等待跳转
+            # 6. 等待登录成功跳回面板
             print("等待登录跳转...")
             for i in range(20):
                 if "panel.chmlfrp.net" in page.url and "login" not in page.url and "qzhua" not in page.url:
@@ -607,51 +607,118 @@ def main():
                 browser.close()
                 sys.exit(1)
 
-            # 7. 签到
-            print("寻找签到按钮...")
+            # 7. 等待面板加载，定位并点击签到按钮
+            print("等待面板加载并寻找签到按钮...")
             sign_clicked = False
-            for text in ["每日签到", "立即签到", "去签到", "签到领", "签到"]:
-                try:
-                    btn = page.get_by_text(text, exact=False)
-                    if btn.count() > 0:
-                        for i in range(btn.count()):
-                            if btn.nth(i).is_visible():
-                                btn.nth(i).click()
-                                print(f"点击了'{text}'")
-                                sign_clicked = True
-                                break
-                        if sign_clicked:
-                            break
-                except:
-                    continue
 
-            if not sign_clicked:
-                try:
-                    btns = page.locator("button, a, [role='button']")
-                    for i in range(btns.count()):
+            # 先尝试关闭可能遮挡的弹窗（×关闭按钮）
+            try:
+                for i in range(6):
+                    close_found = False
+                    for cbtn in [page.locator("[aria-label='关闭']"), page.locator("[aria-label='Close']"),
+                                 page.locator("text=×"), page.locator("text=关闭")]:
                         try:
-                            txt = btns.nth(i).inner_text(timeout=500)
-                            if "签" in txt:
-                                btns.nth(i).click()
-                                print(f"兜底点击签到: {txt}")
-                                sign_clicked = True
-                                break
+                            if cbtn.count() > 0:
+                                for j in range(cbtn.count()):
+                                    try:
+                                        if cbtn.nth(j).is_visible():
+                                            cbtn.nth(j).click(timeout=1000)
+                                            print("关闭了弹窗")
+                                            close_found = True
+                                            break
+                                    except:
+                                        pass
                         except:
-                            continue
+                            pass
+                        if close_found:
+                            break
+                    if not close_found:
+                        break
+                    time.sleep(1)
+            except:
+                pass
+
+            # 轮询等待"签到"按钮出现（面板是SPA，需时间渲染，最多等30秒）
+            sign_btn = None
+            for wait_i in range(15):
+                try:
+                    for sel in [page.get_by_text("签到", exact=True), page.get_by_text("签 到", exact=True)]:
+                        cnt = sel.count()
+                        for i in range(cnt):
+                            try:
+                                el = sel.nth(i)
+                                if el.is_visible():
+                                    t = el.inner_text(timeout=300).strip()
+                                    if t.replace(" ", "") == "签到":
+                                        sign_btn = el
+                                        break
+                            except:
+                                pass
+                        if sign_btn:
+                            break
+                    if sign_btn:
+                        print(f"找到签到按钮: '{sign_btn.inner_text().strip()}'")
+                        break
+                except:
+                    pass
+                time.sleep(2)
+
+            # 兜底：打印页面所有含"签"的文字，方便定位
+            if not sign_btn:
+                print("未直接找到签到按钮，枚举页面含'签'的文字：")
+                try:
+                    body_txt = page.inner_text("body")
+                    for line in body_txt.split("\n"):
+                        if "签" in line:
+                            print(f"  [文本] {line.strip()[:50]}")
+                except:
+                    pass
+
+            if sign_btn:
+                try:
+                    sign_btn.click(timeout=5000)
+                    print("已点击签到按钮")
+                    sign_clicked = True
                 except Exception as e:
-                    print(f"兜底查找异常: {e}")
+                    print(f"点击签到按钮失败: {e}，尝试强制点击")
+                    try:
+                        sign_btn.click(force=True, timeout=3000)
+                        print("强制点击签到按钮成功")
+                        sign_clicked = True
+                    except:
+                        pass
 
             if not sign_clicked:
                 result_msg = "未找到签到按钮"
                 page.screenshot(path="error_no_sign.png")
+                print(result_msg)
                 send_email("ChmlFrp签到失败", result_msg)
                 browser.close()
                 sys.exit(1)
 
+            # 7.5 处理签到确认弹窗（点签到后可能弹出"确认签到"提示）
+            time.sleep(2)
+            for text in ["确认签到", "确定", "确认", "领取", "立即签到"]:
+                try:
+                    btn = page.get_by_text(text, exact=False)
+                    if btn.count() > 0:
+                        for i in range(btn.count()):
+                            try:
+                                if btn.nth(i).is_visible():
+                                    btn.nth(i).click(timeout=1500)
+                                    print(f"点击了确认弹窗'{text}'")
+                                    time.sleep(2)
+                                    break
+                            except:
+                                pass
+                        break
+                except:
+                    continue
+
             time.sleep(3)
             page.screenshot(path="step4_after_sign.png")
 
-            # 8. 签到极验
+            # 8. 处理签到时的极验验证码
             try:
                 if page.locator(".geetest_wrap").is_visible():
                     print("签到需要极验验证")
