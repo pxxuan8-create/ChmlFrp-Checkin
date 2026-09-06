@@ -1,9 +1,11 @@
 import os, json, time, base64, requests, sys
+import pyotp
 from playwright.sync_api import sync_playwright
 
 USERNAME = os.environ.get("CHML_USERNAME", "")
 PASSWORD = os.environ.get("CHML_PASSWORD", "")
 PANEL_URL = os.environ.get("CHML_URL", "https://panel.chmlfrp.net/home")
+TOTP_SECRET = os.environ.get("TOTP_SECRET", "")
 AI_BASE_URL = os.environ.get("AI_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
 AI_API_KEY = os.environ.get("AI_API_KEY", "")
 AI_MODEL = os.environ.get("AI_MODEL", "qwen-vl-plus")
@@ -126,6 +128,163 @@ def solve_geetest(page):
     print("极验验证3次均失败")
     return False
 
+def handle_mfa(page):
+    """处理 MFA 二次验证：自动生成 TOTP 验证码并填入"""
+    if "/mfa" not in page.url:
+        print("未检测到 MFA 页面，跳过")
+        return True
+
+    if not TOTP_SECRET:
+        print("未配置 TOTP_SECRET，无法处理 MFA")
+        return False
+
+    print("检测到 MFA 页面，开始处理 TOTP 验证")
+    time.sleep(3)
+    page.screenshot(path="mfa_page.png")
+
+    # 打印页面元素，方便调试
+    all_inputs = page.locator("input")
+    print(f"MFA页面共有 {all_inputs.count()} 个input")
+    for i in range(all_inputs.count()):
+        try:
+            inp = all_inputs.nth(i)
+            itype = inp.get_attribute("type") or "text"
+            iname = inp.get_attribute("name") or ""
+            iplaceholder = inp.get_attribute("placeholder") or ""
+            visible = inp.is_visible()
+            print(f"  input[{i}]: type={itype}, name={iname}, placeholder={iplaceholder}, visible={visible}")
+        except:
+            pass
+
+    all_buttons = page.locator("button")
+    print(f"MFA页面共有 {all_buttons.count()} 个button")
+    for i in range(all_buttons.count()):
+        try:
+            btn = all_buttons.nth(i)
+            if btn.is_visible():
+                txt = btn.inner_text(timeout=500)
+                print(f"  button[{i}]: text='{txt}'")
+        except:
+            pass
+
+    # 如果有"验证器/TOTP/Authenticator"选项，先点击切换
+    for text in ["验证器", "TOTP", "Authenticator", "身份验证器", "动态验证码"]:
+        try:
+            el = page.get_by_text(text, exact=False)
+            if el.count() > 0 and el.first.is_visible():
+                el.first.click()
+                print(f"点击了'{text}'选项")
+                time.sleep(2)
+                break
+        except:
+            continue
+
+    # 生成 TOTP 验证码（重试3次，防止刚好跨30秒边界）
+    totp = pyotp.TOTP(TOTP_SECRET)
+    code = None
+    for attempt in range(3):
+        code = totp.now()
+        print(f"生成 TOTP 验证码: {code} (尝试{attempt+1})")
+        # 验证一下还有效
+        if totp.verify(code, valid_window=1):
+            break
+        time.sleep(1)
+
+    if not code:
+        print("TOTP 验证码生成失败")
+        return False
+
+    # 填入验证码：尝试多种输入框结构
+    filled = False
+
+    # 方式1：6个单独的输入框（常见于 MFA 页面）
+    digit_inputs = []
+    for i in range(all_inputs.count()):
+        try:
+            inp = all_inputs.nth(i)
+            itype = (inp.get_attribute("type") or "text").lower()
+            if itype in ["text", "tel", "number"] and inp.is_visible():
+                # 排除隐藏的 csrf 等
+                iname = (inp.get_attribute("name") or "").lower()
+                if "csrf" not in iname and "continue" not in iname and "finger" not in iname:
+                    digit_inputs.append(inp)
+        except:
+            pass
+
+    print(f"找到 {len(digit_inputs)} 个可见数字输入框")
+
+    if len(digit_inputs) >= 6:
+        # 6个单独框，逐个输入
+        print("使用6框模式输入")
+        for i, ch in enumerate(code[:6]):
+            try:
+                digit_inputs[i].click()
+                time.sleep(0.1)
+                digit_inputs[i].type(ch, delay=30)
+            except Exception as e:
+                print(f"输入第{i+1}位失败: {e}")
+        filled = True
+    elif len(digit_inputs) == 1:
+        # 一个输入框，输入完整6位
+        print("使用单框模式输入")
+        digit_inputs[0].click()
+        time.sleep(0.1)
+        digit_inputs[0].type(code, delay=50)
+        filled = True
+    else:
+        # 兜底：找第一个可见 input，逐字输入（页面可能自动跳框）
+        print("兜底模式：在第一个可见输入框输入完整验证码")
+        for inp in digit_inputs:
+            try:
+                inp.click()
+                time.sleep(0.1)
+                inp.type(code, delay=50)
+                filled = True
+                break
+            except:
+                continue
+
+    if not filled:
+        print("无法填入验证码")
+        page.screenshot(path="mfa_fill_fail.png")
+        return False
+
+    time.sleep(1)
+    page.screenshot(path="mfa_filled.png")
+
+    # 点击确认/提交按钮
+    submit_clicked = False
+    for text in ["确认", "验证", "提交", "登录", "继续", "下一步", "Verify", "Submit"]:
+        try:
+            btn = page.get_by_text(text, exact=False)
+            if btn.count() > 0:
+                for i in range(btn.count()):
+                    if btn.nth(i).is_visible():
+                        btn.nth(i).click()
+                        print(f"点击了'{text}'按钮")
+                        submit_clicked = True
+                        break
+                if submit_clicked:
+                    break
+        except:
+            continue
+
+    if not submit_clicked:
+        # 兜底：按回车
+        print("未找到确认按钮，按回车")
+        page.keyboard.press("Enter")
+
+    time.sleep(5)
+    page.screenshot(path="mfa_after_submit.png")
+    print(f"MFA提交后URL: {page.url}")
+
+    # 检查是否通过
+    if "/mfa" in page.url:
+        print("MFA 验证后仍在 MFA 页面，可能验证失败")
+        return False
+    print("MFA 验证通过！")
+    return True
+
 def main():
     result_msg, success = "", False
     with sync_playwright() as p:
@@ -156,7 +315,7 @@ def main():
             page.screenshot(path="step1_login.png")
             print(f"登录页URL: {page.url}")
 
-            # 打印页面所有input信息，方便调试
+            # 打印input信息
             all_inputs = page.locator("input")
             input_count = all_inputs.count()
             print(f"页面共有 {input_count} 个input")
@@ -171,19 +330,17 @@ def main():
                 except:
                     pass
 
-            # 2. 定位用户名输入框：优先password前面的那个可见input
+            # 2. 定位用户名密码框
             username_input = None
             password_input = page.locator("input[type='password']").first
             try:
                 password_input.wait_for(state="visible", timeout=5000)
                 print("找到密码框")
-                # 用户名框 = 密码框前面的第一个可见text input
                 for i in range(input_count):
                     try:
                         inp = all_inputs.nth(i)
                         itype = (inp.get_attribute("type") or "text").lower()
                         if itype in ["text","email","tel","username"] and inp.is_visible():
-                            # 检查这个input是否在密码框前面
                             username_input = inp
                             print(f"找到用户名框: input[{i}]")
                             break
@@ -193,7 +350,6 @@ def main():
                 print(f"找密码框异常: {e}")
 
             if not username_input:
-                # 兜底：第一个可见input
                 for i in range(input_count):
                     try:
                         inp = all_inputs.nth(i)
@@ -212,13 +368,12 @@ def main():
                 browser.close()
                 sys.exit(1)
 
-            # 3. 用 type() 逐字输入（对 React 受控组件更友好）
+            # 3. 输入用户名密码
             print("输入用户名...")
             username_input.click()
             time.sleep(0.3)
             username_input.type(USERNAME, delay=50)
             time.sleep(0.5)
-            # 验证是否填进去了
             uname_val = username_input.input_value()
             print(f"用户名框当前值: '{uname_val}'")
             if uname_val != USERNAME:
@@ -233,10 +388,9 @@ def main():
             time.sleep(0.5)
             pwd_val = password_input.input_value()
             print(f"密码框当前值长度: {len(pwd_val)}")
-
             page.screenshot(path="step1b_filled.png")
 
-                        # 4. 点击登录按钮：排除第三方登录，优先纯"登录"文字
+            # 4. 点击登录按钮
             time.sleep(0.5)
             login_btn = None
             all_buttons = page.locator("button")
@@ -250,21 +404,16 @@ def main():
                         txt = btn.inner_text(timeout=500).strip()
                         txt_nospace = txt.replace(" ", "").replace("\u3000", "")
                         print(f"  button[{i}]: text='{txt}'")
-                        # 排除第三方登录按钮
                         is_third_party = any(k in txt for k in ["Apple", "QQ", "微信", "WeChat", "Github", "Google", "第三方"])
                         if not is_third_party and ("登录" in txt_nospace or "登陆" in txt_nospace or "Sign" in txt):
                             candidates.append((i, btn, len(txt)))
                 except:
                     continue
-            # 选文字最短的（纯"登录"按钮比"登录并同意..."短）
             if candidates:
                 candidates.sort(key=lambda x: x[2])
                 login_btn = candidates[0][1]
                 print(f"选中登录按钮: button[{candidates[0][0]}]")
-
-
             if not login_btn:
-                # 兜底：第一个可见button
                 for i in range(btn_count):
                     try:
                         btn = all_buttons.nth(i)
@@ -274,9 +423,7 @@ def main():
                             break
                     except:
                         continue
-
             if not login_btn:
-                # 最后兜底：按回车
                 print("未找到按钮，按回车提交")
                 page.keyboard.press("Enter")
             else:
@@ -297,6 +444,17 @@ def main():
             except Exception as e:
                 print(f"检查验证码异常: {e}")
 
+            # 5.5 处理 MFA 二次验证（新增）
+            if "/mfa" in page.url:
+                if not handle_mfa(page):
+                    result_msg = "MFA 二次验证失败"
+                    page.screenshot(path="error_mfa.png")
+                    print(result_msg)
+                    send_email("ChmlFrp签到失败", result_msg)
+                    browser.close()
+                    sys.exit(1)
+                time.sleep(3)
+
             # 6. 等待登录成功跳回面板
             print("等待登录跳转...")
             for i in range(20):
@@ -307,9 +465,8 @@ def main():
             page.screenshot(path="step3_panel.png")
             print(f"当前URL: {page.url}")
 
-            # 如果还在登录页，判定失败
-            if "qzhua" in page.url or "login" in page.url:
-                result_msg = "登录失败，仍在登录页（账号密码错误/验证码未过/页面报错）"
+            if "qzhua" in page.url or "login" in page.url or "/mfa" in page.url:
+                result_msg = "登录失败，仍在认证页面（账号密码错误/MFA失败/页面报错）"
                 page.screenshot(path="error_login_fail.png")
                 print(result_msg)
                 send_email("ChmlFrp签到失败", result_msg)
