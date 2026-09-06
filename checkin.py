@@ -1,4 +1,4 @@
-import os, json, time, base64, requests
+import os, json, time, base64, requests, sys
 from playwright.sync_api import sync_playwright
 
 USERNAME = os.environ.get("CHML_USERNAME", "")
@@ -126,32 +126,6 @@ def solve_geetest(page):
     print("极验验证3次均失败")
     return False
 
-def find_and_fill(page, selectors, value, name):
-    """依次尝试多个选择器，找到可见元素后填充"""
-    for sel in selectors:
-        try:
-            el = page.locator(sel).first
-            el.wait_for(state="visible", timeout=2000)
-            el.fill(value)
-            print(f"已填充{name}: {sel}")
-            return True
-        except:
-            continue
-    return False
-
-def find_and_click(page, selectors, name):
-    """依次尝试多个选择器，找到可见元素后点击"""
-    for sel in selectors:
-        try:
-            el = page.locator(sel).first
-            if el.is_visible():
-                el.click()
-                print(f"已点击{name}: {sel}")
-                return True
-        except:
-            continue
-    return False
-
 def main():
     result_msg, success = "", False
     with sync_playwright() as p:
@@ -171,64 +145,139 @@ def main():
         """)
         page = context.new_page()
         try:
-            # 1. 打开面板，会自动跳转到 OAuth2 登录页
+            # 1. 打开面板，自动跳转 OAuth2 登录页
             print(f"打开面板: {PANEL_URL}")
             page.goto(PANEL_URL, timeout=30000, wait_until="domcontentloaded")
-            # 等待跳转到登录页（account.qzhua.net）
-            for i in range(10):
+            for i in range(12):
                 if "qzhua" in page.url or "login" in page.url:
                     break
                 time.sleep(1)
-            time.sleep(3)
+            time.sleep(4)
             page.screenshot(path="step1_login.png")
             print(f"登录页URL: {page.url}")
 
-            # 2. 填充用户名
-            username_ok = find_and_fill(page, [
-                "input[name='username']",
-                "input[name='account']",
-                "input[placeholder*='用户']",
-                "input[placeholder*='账号']",
-                "input[placeholder*='邮箱']",
-                "input[type='text']",
-                "input[type='email']"
-            ], USERNAME, "用户名")
+            # 打印页面所有input信息，方便调试
+            all_inputs = page.locator("input")
+            input_count = all_inputs.count()
+            print(f"页面共有 {input_count} 个input")
+            for i in range(input_count):
+                try:
+                    inp = all_inputs.nth(i)
+                    itype = inp.get_attribute("type") or "text"
+                    iname = inp.get_attribute("name") or ""
+                    iplaceholder = inp.get_attribute("placeholder") or ""
+                    visible = inp.is_visible()
+                    print(f"  input[{i}]: type={itype}, name={iname}, placeholder={iplaceholder}, visible={visible}")
+                except:
+                    pass
 
-            # 3. 填充密码
-            password_ok = find_and_fill(page, [
-                "input[type='password']",
-                "input[name='password']",
-                "input[placeholder*='密码']"
-            ], PASSWORD, "密码")
+            # 2. 定位用户名输入框：优先password前面的那个可见input
+            username_input = None
+            password_input = page.locator("input[type='password']").first
+            try:
+                password_input.wait_for(state="visible", timeout=5000)
+                print("找到密码框")
+                # 用户名框 = 密码框前面的第一个可见text input
+                for i in range(input_count):
+                    try:
+                        inp = all_inputs.nth(i)
+                        itype = (inp.get_attribute("type") or "text").lower()
+                        if itype in ["text","email","tel","username"] and inp.is_visible():
+                            # 检查这个input是否在密码框前面
+                            username_input = inp
+                            print(f"找到用户名框: input[{i}]")
+                            break
+                    except:
+                        continue
+            except Exception as e:
+                print(f"找密码框异常: {e}")
 
-            if not username_ok or not password_ok:
+            if not username_input:
+                # 兜底：第一个可见input
+                for i in range(input_count):
+                    try:
+                        inp = all_inputs.nth(i)
+                        if inp.is_visible():
+                            username_input = inp
+                            print(f"兜底用第一个可见input[{i}]")
+                            break
+                    except:
+                        continue
+
+            if not username_input or not password_input:
                 result_msg = "未找到用户名或密码输入框"
                 page.screenshot(path="error_no_input.png")
                 print(result_msg)
                 send_email("ChmlFrp签到失败", result_msg)
                 browser.close()
-                return
+                sys.exit(1)
 
+            # 3. 用 type() 逐字输入（对 React 受控组件更友好）
+            print("输入用户名...")
+            username_input.click()
+            time.sleep(0.3)
+            username_input.type(USERNAME, delay=50)
             time.sleep(0.5)
+            # 验证是否填进去了
+            uname_val = username_input.input_value()
+            print(f"用户名框当前值: '{uname_val}'")
+            if uname_val != USERNAME:
+                print("用户名填充不一致，尝试fill...")
+                username_input.fill(USERNAME)
+                time.sleep(0.3)
 
-            # 4. 点击登录按钮
-            login_ok = find_and_click(page, [
-                "button:has-text('登录')",
-                "button:has-text('登 录')",
-                "button:has-text('立即登录')",
-                "button:has-text('Sign in')",
-                "[type='submit']",
-                ".login-btn",
-                ".submit-btn",
-                "button.btn-primary"
-            ], "登录按钮")
+            print("输入密码...")
+            password_input.click()
+            time.sleep(0.3)
+            password_input.type(PASSWORD, delay=50)
+            time.sleep(0.5)
+            pwd_val = password_input.input_value()
+            print(f"密码框当前值长度: {len(pwd_val)}")
 
-            if not login_ok:
+            page.screenshot(path="step1b_filled.png")
+
+            # 4. 点击登录按钮：找第一个可见button，或包含登录文字的元素
+            time.sleep(0.5)
+            login_btn = None
+            all_buttons = page.locator("button")
+            btn_count = all_buttons.count()
+            print(f"页面共有 {btn_count} 个button")
+            for i in range(btn_count):
+                try:
+                    btn = all_buttons.nth(i)
+                    if btn.is_visible():
+                        txt = btn.inner_text(timeout=500)
+                        print(f"  button[{i}]: text='{txt}'")
+                        if "登录" in txt or "登陆" in txt or "Sign" in txt:
+                            login_btn = btn
+                            print(f"选中登录按钮: button[{i}]")
+                            break
+                except:
+                    continue
+
+            if not login_btn:
+                # 兜底：第一个可见button
+                for i in range(btn_count):
+                    try:
+                        btn = all_buttons.nth(i)
+                        if btn.is_visible():
+                            login_btn = btn
+                            print(f"兜底用第一个可见button[{i}]")
+                            break
+                    except:
+                        continue
+
+            if not login_btn:
+                # 最后兜底：按回车
+                print("未找到按钮，按回车提交")
                 page.keyboard.press("Enter")
-                print("按回车提交")
+            else:
+                print("点击登录按钮")
+                login_btn.click()
 
-            time.sleep(5)
-            page.screenshot(path="step2_after_login_click.png")
+            time.sleep(6)
+            page.screenshot(path="step2_after_login.png")
+            print(f"点击后URL: {page.url}")
 
             # 5. 处理登录时的极验验证码
             try:
@@ -236,51 +285,54 @@ def main():
                     print("登录需要极验验证码")
                     solve_geetest(page)
                     time.sleep(3)
-            except:
-                pass
+                    page.screenshot(path="step2b_after_captcha.png")
+            except Exception as e:
+                print(f"检查验证码异常: {e}")
 
-            # 6. 等待登录成功，跳回面板
+            # 6. 等待登录成功跳回面板
             print("等待登录跳转...")
-            for i in range(15):
-                if "panel.chmlfrp.net" in page.url and "login" not in page.url:
+            for i in range(20):
+                if "panel.chmlfrp.net" in page.url and "login" not in page.url and "qzhua" not in page.url:
                     break
                 time.sleep(1)
             time.sleep(3)
             page.screenshot(path="step3_panel.png")
-            print(f"面板URL: {page.url}")
+            print(f"当前URL: {page.url}")
 
-            # 如果还在登录页，说明登录失败
+            # 如果还在登录页，判定失败
             if "qzhua" in page.url or "login" in page.url:
-                result_msg = "登录失败，仍在登录页（可能账号密码错误或验证码未过）"
+                result_msg = "登录失败，仍在登录页（账号密码错误/验证码未过/页面报错）"
                 page.screenshot(path="error_login_fail.png")
                 print(result_msg)
                 send_email("ChmlFrp签到失败", result_msg)
                 browser.close()
-                return
+                sys.exit(1)
 
             # 7. 找签到按钮
             print("寻找签到按钮...")
-            sign_clicked = find_and_click(page, [
-                "button:has-text('每日签到')",
-                "button:has-text('立即签到')",
-                "button:has-text('去签到')",
-                "button:has-text('签到领')",
-                "a:has-text('每日签到')",
-                "a:has-text('立即签到')",
-                "a:has-text('去签到')",
-                "[class*='sign'] button",
-                "[class*='checkin'] button",
-                "[class*='qiandao'] button"
-            ], "签到按钮")
+            sign_clicked = False
+            for text in ["每日签到", "立即签到", "去签到", "签到领", "签到"]:
+                try:
+                    btn = page.get_by_text(text, exact=False)
+                    if btn.count() > 0:
+                        for i in range(btn.count()):
+                            if btn.nth(i).is_visible():
+                                btn.nth(i).click()
+                                print(f"点击了'{text}'")
+                                sign_clicked = True
+                                break
+                        if sign_clicked:
+                            break
+                except:
+                    continue
 
             if not sign_clicked:
-                # 兜底：遍历所有可点击元素找"签"字
                 try:
                     btns = page.locator("button, a, [role='button']")
                     for i in range(btns.count()):
                         try:
                             txt = btns.nth(i).inner_text(timeout=500)
-                            if "签" in txt and "到" in txt:
+                            if "签" in txt:
                                 btns.nth(i).click()
                                 print(f"兜底点击签到: {txt}")
                                 sign_clicked = True
@@ -295,10 +347,10 @@ def main():
                 page.screenshot(path="error_no_sign.png")
                 send_email("ChmlFrp签到失败", result_msg)
                 browser.close()
-                return
+                sys.exit(1)
 
             time.sleep(3)
-            page.screenshot(path="step4_after_sign_click.png")
+            page.screenshot(path="step4_after_sign.png")
 
             # 8. 处理签到时的极验验证码
             try:
@@ -309,7 +361,7 @@ def main():
                         page.screenshot(path="geetest_fail.png")
                         send_email("ChmlFrp签到失败", result_msg)
                         browser.close()
-                        return
+                        sys.exit(1)
             except:
                 print("未检测到极验验证码")
 
@@ -328,6 +380,8 @@ def main():
         except Exception as e:
             result_msg = f"脚本异常: {str(e)}"
             print(result_msg)
+            import traceback
+            traceback.print_exc()
             try:
                 page.screenshot(path="error.png")
             except:
@@ -338,7 +392,7 @@ def main():
     status = "成功" if success else "失败"
     send_email(f"ChmlFrp每日签到 - {status}", result_msg)
     if not success:
-        exit(1)
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
