@@ -70,7 +70,6 @@ def fetch_email_code():
         mail.login(EMAIL_ADDRESS, EMAIL_IMAP_PASSWORD)
         mail.select("INBOX")
 
-        # 不用IMAP搜索（中文搜索会ASCII编码报错），直接取最近30封，在Python里过滤
         result, data = mail.search(None, "ALL")
         if result != "OK" or not data[0]:
             print("收件箱为空")
@@ -79,7 +78,7 @@ def fetch_email_code():
 
         ids = data[0].split()
         latest_ids = ids[-30:] if len(ids) >= 30 else ids
-        latest_ids.reverse()  # 最新的在前
+        latest_ids.reverse()
 
         import datetime
         from email.utils import parsedate_to_datetime
@@ -90,7 +89,6 @@ def fetch_email_code():
                 continue
             msg = email.message_from_bytes(msg_data[0][1])
 
-            # 解析主题（兼容多种编码）
             subject = ""
             subj_parts = decode_header(msg["Subject"])
             for part, enc in subj_parts:
@@ -102,18 +100,15 @@ def fetch_email_code():
                 else:
                     subject += part
 
-            # 解析发件人
             from_addr = msg.get("From", "")
             from_lower = from_addr.lower()
 
-            # Python里过滤：主题含验证/验证码/code，或发件人含qzhua/chmlfrp
             is_verify_email = any(k in subject for k in ["验证", "验证码", "code", "Code", "CODE", "动态码"]) or \
                               any(k in from_lower for k in ["qzhua", "chmlfrp"])
 
             if not is_verify_email:
                 continue
 
-            # 只看最近10分钟的邮件
             try:
                 msg_date = parsedate_to_datetime(msg["Date"])
                 if (datetime.datetime.now(datetime.timezone.utc) - msg_date).total_seconds() > 600:
@@ -123,7 +118,6 @@ def fetch_email_code():
 
             print(f"找到候选邮件: 主题='{subject}', 发件人='{from_addr}'")
 
-            # 提取正文
             body = ""
             if msg.is_multipart():
                 for part in msg.walk():
@@ -143,11 +137,9 @@ def fetch_email_code():
                 except:
                     pass
 
-            # 去HTML标签，压缩空白
             body_clean = re.sub(r"<[^>]+>", " ", body)
             body_clean = re.sub(r"\s+", " ", body_clean)
 
-            # 找6位数字验证码（优先匹配"验证码：xxx"格式，兜底纯6位数字）
             patterns = [
                 r"验证码[：:\s是为]+(\d{6})",
                 r"验证代码[：:\s是为]+(\d{6})",
@@ -266,7 +258,6 @@ def handle_mfa(page):
     time.sleep(3)
     page.screenshot(path="mfa_page.png")
 
-    # 打印页面元素
     all_inputs = page.locator("input")
     print(f"MFA页面共有 {all_inputs.count()} 个input")
     for i in range(all_inputs.count()):
@@ -291,7 +282,6 @@ def handle_mfa(page):
         except:
             pass
 
-    # 切换到邮箱验证码模式
     email_mode = False
     for text in ["邮箱验证码", "邮箱", "Email", "EMAIL"]:
         try:
@@ -312,7 +302,6 @@ def handle_mfa(page):
     if not email_mode:
         print("未找到邮箱验证码选项，尝试直接发送")
 
-    # 点击"发送验证码"按钮（如果有）
     send_clicked = False
     for text in ["发送验证码", "获取验证码", "发送", "重新发送", "获取"]:
         try:
@@ -333,7 +322,6 @@ def handle_mfa(page):
     if not send_clicked:
         print("未找到发送按钮，可能已自动发送")
 
-    # 等待邮件并读取验证码（最多等60秒，每5秒查一次）
     code = None
     for attempt in range(12):
         print(f"等待验证码邮件... ({attempt+1}/12)")
@@ -347,7 +335,6 @@ def handle_mfa(page):
         page.screenshot(path="mfa_no_email.png")
         return False
 
-    # 填入验证码
     time.sleep(1)
     all_inputs = page.locator("input")
     digit_inputs = []
@@ -389,7 +376,6 @@ def handle_mfa(page):
     time.sleep(1)
     page.screenshot(path="mfa_filled.png")
 
-    # 点击确认/提交按钮
     submit_clicked = False
     for text in ["确认", "验证", "提交", "登录", "继续", "下一步", "Verify", "Submit"]:
         try:
@@ -607,38 +593,25 @@ def main():
                 browser.close()
                 sys.exit(1)
 
-            # 7. 等待面板加载，定位并点击签到按钮
+            # 7. 等待面板加载
             print("等待面板加载并寻找签到按钮...")
             sign_clicked = False
 
-            # 先尝试关闭可能遮挡的弹窗（×关闭按钮）
+            # 7a. 用JS强制移除登录后的公告弹窗/遮罩（Naive UI modal 会拦截点击）
             try:
-                for i in range(6):
-                    close_found = False
-                    for cbtn in [page.locator("[aria-label='关闭']"), page.locator("[aria-label='Close']"),
-                                 page.locator("text=×"), page.locator("text=关闭")]:
-                        try:
-                            if cbtn.count() > 0:
-                                for j in range(cbtn.count()):
-                                    try:
-                                        if cbtn.nth(j).is_visible():
-                                            cbtn.nth(j).click(timeout=1000)
-                                            print("关闭了弹窗")
-                                            close_found = True
-                                            break
-                                    except:
-                                        pass
-                        except:
-                            pass
-                        if close_found:
-                            break
-                    if not close_found:
-                        break
-                    time.sleep(1)
-            except:
-                pass
+                removed = page.evaluate("""() => {
+                    let n = 0;
+                    document.querySelectorAll('.n-modal-mask').forEach(e => { e.remove(); n++; });
+                    document.querySelectorAll('.n-modal-container').forEach(e => { e.remove(); n++; });
+                    document.querySelectorAll('.n-overlay, .n-drawer-mask').forEach(e => { e.remove(); n++; });
+                    return n;
+                }""")
+                print(f"JS移除弹窗/遮罩: {removed}个")
+                time.sleep(1)
+            except Exception as e:
+                print(f"JS移除弹窗异常: {e}")
 
-            # 轮询等待"签到"按钮出现（面板是SPA，需时间渲染，最多等30秒）
+            # 轮询等待"签到"按钮出现（面板是SPA，最多等30秒）
             sign_btn = None
             for wait_i in range(15):
                 try:
@@ -663,7 +636,6 @@ def main():
                     pass
                 time.sleep(2)
 
-            # 兜底：打印页面所有含"签"的文字，方便定位
             if not sign_btn:
                 print("未直接找到签到按钮，枚举页面含'签'的文字：")
                 try:
@@ -680,10 +652,10 @@ def main():
                     print("已点击签到按钮")
                     sign_clicked = True
                 except Exception as e:
-                    print(f"点击签到按钮失败: {e}，尝试强制点击")
+                    print(f"点击签到失败: {e}，尝试强制点击")
                     try:
                         sign_btn.click(force=True, timeout=3000)
-                        print("强制点击签到按钮成功")
+                        print("强制点击成功")
                         sign_clicked = True
                     except:
                         pass
@@ -696,17 +668,40 @@ def main():
                 browser.close()
                 sys.exit(1)
 
-            # 7.5 处理签到确认弹窗（点签到后可能弹出"确认签到"提示）
-            time.sleep(2)
-            for text in ["确认签到", "确定", "确认", "领取", "立即签到"]:
+            # 7b. 等签到弹窗出现，打印页面文字和所有可见按钮（定位签到动作按钮）
+            time.sleep(3)
+            print("===== 签到后页面文字(前1200字符) =====")
+            try:
+                body_txt = page.inner_text("body")
+                print(body_txt[:1200])
+                print("===== 结束 =====")
+            except:
+                pass
+            try:
+                all_btns = page.locator("button")
+                print(f"===== 页面可见按钮({all_btns.count()}) =====")
+                for i in range(all_btns.count()):
+                    try:
+                        if all_btns.nth(i).is_visible():
+                            t = all_btns.nth(i).inner_text(timeout=300).strip()
+                            if t:
+                                print(f"  [按钮] '{t[:40]}'")
+                    except:
+                        pass
+            except:
+                pass
+
+            # 7c. 点击签到弹窗里的动作按钮（立即签到/领取积分/确认签到）
+            for text in ["立即签到", "签到领积分", "领取积分", "确认签到", "签到成功", "签到"]:
                 try:
                     btn = page.get_by_text(text, exact=False)
                     if btn.count() > 0:
                         for i in range(btn.count()):
                             try:
                                 if btn.nth(i).is_visible():
+                                    t = btn.nth(i).inner_text(timeout=300).strip()
                                     btn.nth(i).click(timeout=1500)
-                                    print(f"点击了确认弹窗'{text}'")
+                                    print(f"点击了'{t}'")
                                     time.sleep(2)
                                     break
                             except:
@@ -714,9 +709,6 @@ def main():
                         break
                 except:
                     continue
-
-            time.sleep(3)
-            page.screenshot(path="step4_after_sign.png")
 
             # 8. 处理签到时的极验验证码
             try:
